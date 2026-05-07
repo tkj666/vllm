@@ -1012,19 +1012,60 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         provider = getattr(layer, "expert_weight_provider", None)
         if provider is not None:
-            result = provider.prepare(topk_ids)
-            return self.moe_kernel.apply(
-                x,
-                result.w1,
-                result.w2,
-                topk_weights,
-                result.topk_ids,
-                activation=layer.activation,
-                global_num_experts=layer.global_num_experts,
-                expert_map=layer.expert_map,
-                apply_router_weight_on_input=(layer.apply_router_weight_on_input),
-                shared_experts_input=shared_experts_input,
-            )
+            final_output = None
+            is_first_chunk = True
+            for result in provider.prepare(topk_ids):
+                # expert_map: result.expert_map (per chunk) or layer fallback.
+                expert_map = (
+                    result.expert_map
+                    if result.expert_map is not None
+                    else layer.expert_map
+                )
+
+                if result.token_indices is not None:
+                    # EP-style chunking: slice inputs, mask weights, accumulate.
+                    x_chunk = x[result.token_indices]
+                    ids_chunk = result.topk_ids
+                    # Zero weights for out-of-chunk experts (sentinel == -1).
+                    w_chunk = topk_weights[result.token_indices].clone()
+                    sentinel_mask = ids_chunk == -1
+                    w_chunk[sentinel_mask] = 0.0
+                    ids_chunk = ids_chunk.clamp(min=0)
+                    # shared_experts_input must only be added once.
+                    se_chunk = (
+                        shared_experts_input[result.token_indices]
+                        if shared_experts_input is not None and is_first_chunk
+                        else None
+                    )
+                else:
+                    x_chunk = x
+                    ids_chunk = result.topk_ids
+                    w_chunk = topk_weights
+                    se_chunk = shared_experts_input
+
+                chunk_out = self.moe_kernel.apply(
+                    x_chunk,
+                    result.w1,
+                    result.w2,
+                    w_chunk,
+                    ids_chunk,
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    expert_map=expert_map,
+                    apply_router_weight_on_input=(layer.apply_router_weight_on_input),
+                    shared_experts_input=se_chunk,
+                )
+
+                if result.token_indices is not None:
+                    if final_output is None:
+                        final_output = torch.zeros_like(x)
+                    final_output[result.token_indices] += chunk_out
+                else:
+                    return chunk_out
+
+                is_first_chunk = False
+
+            return final_output
 
         return self.moe_kernel.apply(
             x,

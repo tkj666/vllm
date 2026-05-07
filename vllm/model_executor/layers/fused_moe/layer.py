@@ -725,6 +725,7 @@ class FusedMoE(CustomOp):
             w2_weight=self.w2_weight.data,
             w13_scale=w13_scale,
             w2_scale=w2_scale,
+            global_num_experts=self.global_num_experts,
         )
 
         # Release the full weight tensors (CachedWeightProvider holds its own
