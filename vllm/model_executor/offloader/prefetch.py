@@ -182,16 +182,21 @@ class PrefetchOffloader(BaseOffloader):
             # Select layers to offload based on group pattern
             # Offload last num_in_group layers of each group_size
             if module_index % self.group_size >= self.group_size - self.num_in_group:
+                parameters = [
+                    (name, param)
+                    for name, param in module.named_parameters()
+                    if not getattr(param, "_vllm_streamed_expert_host", False)
+                ]
                 if self.offload_params:
                     whitelist = [
                         name
-                        for name, _ in module.named_parameters()
+                        for name, _ in parameters
                         if any(
                             f".{p}." in f".{prefix}{name}." for p in self.offload_params
                         )
                     ]
                 else:
-                    whitelist = [name for name, _ in module.named_parameters()]
+                    whitelist = [name for name, _ in parameters]
 
                 if not whitelist:
                     continue  # skip layers with no matching params

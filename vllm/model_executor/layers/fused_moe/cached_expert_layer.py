@@ -983,6 +983,11 @@ class _StreamedExpertCacheRuntime:
         prototype_w2: torch.Tensor,
         device: torch.device,
         load_token: object,
+        *,
+        format_class: str = _FORMAT_CLASS,
+        runtime_specs: Mapping[str, Any] | None = None,
+        activation_dtype: torch.dtype | None = None,
+        hidden_size: int | None = None,
     ) -> None:
         self.vllm_config = vllm_config
         offload_config = vllm_config.offload_config
@@ -993,6 +998,9 @@ class _StreamedExpertCacheRuntime:
             layer_id: ordinal for ordinal, layer_id in enumerate(self.layer_ids)
         }
         self.device = device
+        self.format_class = format_class
+        self.activation_dtype = activation_dtype or prototype_w13.dtype
+        self.hidden_size = hidden_size or prototype_w13.shape[-1]
         self._config_ref = weakref.ref(vllm_config)
         self._load_token = load_token
         self._forward_lock = threading.Lock()
@@ -1018,26 +1026,36 @@ class _StreamedExpertCacheRuntime:
         padded_arena_size = ((arena_size + 31) // 32) * 32
         if padded_arena_size >= 1024:
             raise ValueError(
-                "streamed expert-cache arena is too large for Triton alignment: "
+                "streamed expert-cache arena is too large for MoE alignment: "
                 f"{arena_size} slots (maximum 992)"
             )
-        self.w13 = torch.empty(
-            (arena_size, *prototype_w13.shape[1:]),
-            dtype=prototype_w13.dtype,
-            device=device,
-        )
-        self.w2 = torch.empty(
-            (arena_size, *prototype_w2.shape[1:]),
-            dtype=prototype_w2.dtype,
-            device=device,
-        )
+        if runtime_specs is None:
+            runtime_layout = {
+                "w13_weight": (prototype_w13.shape[1:], prototype_w13.dtype),
+                "w2_weight": (prototype_w2.shape[1:], prototype_w2.dtype),
+            }
+        else:
+            runtime_layout = {
+                name: _runtime_tensor_spec(spec) for name, spec in runtime_specs.items()
+            }
+        if not {"w13_weight", "w2_weight"} <= set(runtime_layout):
+            raise ValueError(
+                "streamed expert runtime requires w13_weight and w2_weight"
+            )
+        self.arena_tensors = {
+            name: torch.empty(
+                (arena_size, *shape),
+                dtype=dtype,
+                device=device,
+            )
+            for name, (shape, dtype) in runtime_layout.items()
+        }
+        self.w13 = self.arena_tensors["w13_weight"]
+        self.w2 = self.arena_tensors["w2_weight"]
         arena = tuple(
             ExpertWeightBundle(
-                _FORMAT_CLASS,
-                {
-                    "w13_weight": self.w13[slot],
-                    "w2_weight": self.w2[slot],
-                },
+                format_class,
+                {name: tensor[slot] for name, tensor in self.arena_tensors.items()},
             )
             for slot in range(arena_size)
         )
@@ -1088,6 +1106,12 @@ class _StreamedExpertCacheRuntime:
     def capacity_per_wave(self) -> int:
         return self.per_layer_size + self.shared_size
 
+    def tensor(self, name: str) -> torch.Tensor:
+        try:
+            return self.arena_tensors[name]
+        except KeyError as exc:
+            raise KeyError(f"unknown streamed expert tensor {name!r}") from exc
+
     @property
     def stats(self) -> ExpertCacheStats:
         return self.cache.stats
@@ -1108,7 +1132,7 @@ class _StreamedExpertCacheRuntime:
         binding = self.cache.bind(
             LayerBinding(
                 layer_id=layer_id,
-                format_class=_FORMAT_CLASS,
+                format_class=self.format_class,
                 host_bundles=host_bundles,
                 reserved_slot_indices=range(
                     reserved_start,
@@ -1350,9 +1374,9 @@ class CachedExpertLayer:
             self._topk_ids_staging,
         ) = runtime.get_staging(
             max_num_tokens=max_num_tokens,
-            hidden_size=runtime.w13.shape[-1],
+            hidden_size=runtime.hidden_size,
             top_k=top_k,
-            dtype=runtime.w13.dtype,
+            dtype=runtime.activation_dtype,
         )
         self._execution_buffers = runtime.get_execution_buffers(
             kernel,
@@ -1410,9 +1434,7 @@ class CachedExpertLayer:
 
     @property
     def graph_data_ptrs(self) -> tuple[int, ...]:
-        return (
-            self.runtime.w13.data_ptr(),
-            self.runtime.w2.data_ptr(),
+        return tuple(tensor.data_ptr() for tensor in self._graph_closure_tensors()) + (
             self._hidden_staging.data_ptr(),
             self._shared_output_staging.data_ptr(),
             self._topk_weights_staging.data_ptr(),
@@ -1423,6 +1445,22 @@ class CachedExpertLayer:
             self._execution_buffers.output.data_ptr(),
             self.wave_expert_map.data_ptr(),
             *(tensor.data_ptr() for tensor in self._alignment_outputs),
+        )
+
+    def _graph_closure_tensors(self) -> tuple[torch.Tensor, ...]:
+        kernel = self._kernel
+        graph_tensors = ()
+        if kernel is not None:
+            get_graph_tensors = getattr(
+                kernel.fused_experts,
+                "streamed_graph_tensors",
+                None,
+            )
+            if get_graph_tensors is not None:
+                graph_tensors = tuple(get_graph_tensors())
+        return (
+            *self.runtime.arena_tensors.values(),
+            *graph_tensors,
         )
 
     def set_kernel(self, kernel: FusedMoEKernel) -> None:
@@ -1517,13 +1555,9 @@ class CachedExpertLayer:
         shared_experts_input: torch.Tensor | None,
     ) -> PreparedBatch:
         if topk_ids.dtype != torch.int32:
-            raise ValueError(
-                "streamed expert caching requires int32 Triton routing IDs"
-            )
+            raise ValueError("streamed expert caching requires int32 routing IDs")
         if topk_weights.dtype != torch.float32:
-            raise ValueError(
-                "streamed expert caching requires float32 Triton routing weights"
-            )
+            raise ValueError("streamed expert caching requires float32 routing weights")
         if topk_ids.ndim != 2 or topk_ids.shape[1] != self.top_k:
             raise ValueError(
                 f"expected topk_ids with shape [tokens, {self.top_k}], got "
@@ -1597,8 +1631,8 @@ class CachedExpertLayer:
                 or kernel_batch.topk_ids.data_ptr() != staged_topk_ids.data_ptr()
             ):
                 raise RuntimeError(
-                    "streamed expert caching requires unquantized, undispatched "
-                    "modular Triton inputs"
+                    "streamed expert caching requires undispatched BF16 modular "
+                    "MoE inputs"
                 )
         except Exception as error:
             self._release_prepared_demand(demand)
@@ -1985,6 +2019,7 @@ class CachedExpertLayer:
                 batch.workspace2,
                 self.wave_expert_map,
                 *self._alignment_outputs,
+                *self._graph_closure_tensors(),
             )
         finally:
             self._active_batch = None
@@ -2022,22 +2057,50 @@ def suspend_streamed_expert_cache_prefetch() -> Generator[None, None, None]:
 def bind_streamed_expert_layer(
     layer: RoutedExperts,
     kernel: FusedMoEKernel,
+    *,
+    streamed_weights: Any | None = None,
 ) -> CachedExpertLayer:
     """Move a loaded routed-expert layer into the model's unified arena."""
     vllm_config = get_current_vllm_config()
     if layer.moe_config.has_bias:
         raise ValueError("streamed expert caching does not support expert bias")
-    host_w13 = layer.w13_weight.data
-    host_w2 = layer.w2_weight.data
-    if (
-        host_w13.device.type != "cpu"
-        or host_w2.device.type != "cpu"
-        or not host_w13.is_pinned()
-        or not host_w2.is_pinned()
-    ):
+    if streamed_weights is None:
+        host_w13 = layer.w13_weight.data
+        host_w2 = layer.w2_weight.data
+        format_class = _FORMAT_CLASS
+        runtime_specs: Mapping[str, Any] | None = None
+        activation_dtype = host_w13.dtype
+        hidden_size = host_w13.shape[-1]
+        host_bundles = {
+            expert_id: ExpertWeightBundle(
+                format_class,
+                {
+                    "w13_weight": host_w13[expert_id],
+                    "w2_weight": host_w2[expert_id],
+                },
+            )
+            for expert_id in range(layer.local_num_experts)
+        }
+    else:
+        format_class = streamed_weights.format_class
+        runtime_specs = streamed_weights.runtime_specs
+        activation_dtype = streamed_weights.activation_dtype
+        hidden_size = streamed_weights.hidden_size
+        host_bundles = dict(streamed_weights.host_bundles)
+        if set(host_bundles) != set(range(layer.local_num_experts)):
+            raise ValueError(
+                "streamed expert bundles must cover every local physical expert"
+            )
+        first_bundle = host_bundles[0]
+        host_w13 = first_bundle.tensors["w13_weight"].unsqueeze(0)
+        host_w2 = first_bundle.tensors["w2_weight"].unsqueeze(0)
+
+    if not all(bundle.is_pinned for bundle in host_bundles.values()):
         raise ValueError(
             "streamed expert checkpoint weights must be loaded into pinned CPU memory"
         )
+    if any(bundle.format_class != format_class for bundle in host_bundles.values()):
+        raise ValueError("streamed expert bundles have inconsistent formats")
 
     device = torch.device(layer.moe_config.device)
     if device.index is None:
@@ -2052,27 +2115,28 @@ def bind_streamed_expert_layer(
             host_w2,
             device,
             load_token,
+            format_class=format_class,
+            runtime_specs=runtime_specs,
+            activation_dtype=activation_dtype,
+            hidden_size=hidden_size,
         )
         _RUNTIMES[runtime_key] = runtime
     elif not runtime.belongs_to(vllm_config, load_token):
         raise RuntimeError("stale streamed expert-cache runtime configuration")
+    elif runtime.format_class != format_class:
+        raise RuntimeError(
+            "streamed expert-cache layers cannot mix runtime weight formats"
+        )
 
     layer_id = extract_layer_index(layer.layer_name)
-    host_bundles = {
-        expert_id: ExpertWeightBundle(
-            _FORMAT_CLASS,
-            {
-                "w13_weight": host_w13[expert_id],
-                "w2_weight": host_w2[expert_id],
-            },
-        )
-        for expert_id in range(layer.local_num_experts)
-    }
     binding = runtime.bind(layer_id, host_bundles)
-    replace_parameter(layer, "w13_weight", runtime.w13)
-    replace_parameter(layer, "w2_weight", runtime.w2)
-    layer.w13_weight.weight_loader = _reject_weight_reload
-    layer.w2_weight.weight_loader = _reject_weight_reload
+    for name, tensor in runtime.arena_tensors.items():
+        if not hasattr(layer, name):
+            raise RuntimeError(
+                f"streamed expert layer is missing runtime tensor {name!r}"
+            )
+        replace_parameter(layer, name, tensor)
+        getattr(layer, name).weight_loader = _reject_weight_reload
 
     cached_layer = CachedExpertLayer(
         runtime,
@@ -2090,13 +2154,30 @@ def _moe_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
     config = vllm_config.model_config.hf_text_config
     mlp_only_layers = set(getattr(config, "mlp_only_layers", None) or ())
     sparse_step = getattr(config, "decoder_sparse_step", 1)
+    num_experts = getattr(
+        config,
+        "num_experts",
+        getattr(config, "n_routed_experts", 0),
+    )
     return tuple(
         layer_id
         for layer_id in range(config.num_hidden_layers)
         if layer_id not in mlp_only_layers
-        and config.num_experts > 0
+        and num_experts > 0
         and (layer_id + 1) % sparse_step == 0
     )
+
+
+def _runtime_tensor_spec(spec: Any) -> tuple[torch.Size, torch.dtype]:
+    if isinstance(spec, tuple) and len(spec) == 2:
+        shape, dtype = spec
+    elif isinstance(spec, Mapping):
+        shape, dtype = spec["shape"], spec["dtype"]
+    else:
+        shape, dtype = spec.shape, spec.dtype
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError("streamed expert runtime tensor dtype must be torch.dtype")
+    return torch.Size(shape), dtype
 
 
 def _ordered_unique(expert_ids: torch.Tensor) -> tuple[int, ...]:

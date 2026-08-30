@@ -3858,6 +3858,77 @@ def test_host_routing_staging_uses_one_pinned_allocation(
         runtime.get_host_staging(max_num_tokens=8, top_k=2, num_experts=5)
 
 
+def test_streamed_runtime_allocates_and_copies_generic_quantized_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import cached_expert_layer
+    from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+        _StreamedExpertCacheRuntime,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_cache import (
+        SynchronousExpertTransferCoordinator,
+    )
+
+    class Config:
+        pass
+
+    config = Config()
+    config.offload_config = SimpleNamespace(
+        expert_cache_per_layer_size=0,
+        expert_cache_shared_size=2,
+        expert_cache_prefetch_policy="fifo",
+    )
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            num_hidden_layers=1,
+            n_routed_experts=2,
+            mlp_only_layers=None,
+            decoder_sparse_step=1,
+        )
+    )
+    monkeypatch.setattr(
+        cached_expert_layer,
+        "CudaExpertTransferCoordinator",
+        lambda device: SynchronousExpertTransferCoordinator(),
+    )
+
+    specs = {
+        "w13_weight": SimpleNamespace(shape=(2, 4), dtype=torch.int32),
+        "w2_weight": SimpleNamespace(shape=(3, 2), dtype=torch.int32),
+        "w13_weight_scale": SimpleNamespace(shape=(2, 1), dtype=torch.uint8),
+        "w2_weight_scale": SimpleNamespace(shape=(3, 1), dtype=torch.uint8),
+    }
+    runtime = _StreamedExpertCacheRuntime(
+        config,
+        torch.empty((2, 1, 1), dtype=torch.uint8),
+        torch.empty((2, 1, 1), dtype=torch.uint8),
+        torch.device("cpu"),
+        object(),
+        format_class="mxfp4-marlin-v1",
+        runtime_specs=specs,
+        activation_dtype=torch.bfloat16,
+        hidden_size=4,
+    )
+
+    source_tensors = {
+        name: torch.full(spec.shape, index + 1, dtype=spec.dtype)
+        for index, (name, spec) in enumerate(specs.items())
+    }
+    binding = runtime.bind(
+        0,
+        {0: ExpertWeightBundle("mxfp4-marlin-v1", source_tensors)},
+    )
+    lease = binding.request(0).acquire()
+    try:
+        assert set(runtime.arena_tensors) == set(specs)
+        assert runtime.activation_dtype == torch.bfloat16
+        assert runtime.hidden_size == 4
+        for name, source in source_tensors.items():
+            assert torch.equal(lease.bundle.tensors[name], source)
+    finally:
+        lease.release()
+
+
 def test_release_event_failure_poisons_cache_without_leased_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3976,26 +4047,108 @@ def test_streamed_host_store_preallocates_one_disjoint_storage(
         store.validate_layer(7, w13_7.clone(), w2_7)
 
 
-def test_streamed_host_store_pins_one_precalculated_tensor(
+def test_streamed_host_store_directly_allocates_one_precalculated_pinned_tensor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm.model_executor.layers.fused_moe import unquantized_fused_moe_method
 
-    pinned: list[torch.Tensor] = []
+    empty_calls: list[dict[str, Any]] = []
+    original_empty = torch.empty
 
-    def pin_memory(tensor: torch.Tensor) -> torch.Tensor:
-        pinned.append(tensor)
-        return tensor
+    def record_empty(*args, **kwargs) -> torch.Tensor:
+        empty_calls.append(dict(kwargs))
+        kwargs.pop("pin_memory", None)
+        return original_empty(*args, **kwargs)
 
-    monkeypatch.setattr(torch.Tensor, "pin_memory", pin_memory)
+    monkeypatch.setattr(torch, "empty", record_empty)
     monkeypatch.setattr(torch.UntypedStorage, "is_pinned", lambda storage: True)
 
     storage = unquantized_fused_moe_method._allocate_pinned_storage(4096)
 
     assert storage.nbytes() == 4096
-    assert len(pinned) == 1
-    assert pinned[0].dtype == torch.uint8
-    assert pinned[0].device.type == "cpu"
+    assert empty_calls == [
+        {
+            "dtype": torch.uint8,
+            "device": "cpu",
+            "pin_memory": True,
+        }
+    ]
+
+
+def test_large_streamed_host_store_disables_pinned_power_of_two_rounding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import expert_cache
+
+    applied: list[str] = []
+    monkeypatch.setattr(
+        expert_cache.torch._C,
+        "_accelerator_getAllocatorSettings",
+        lambda: "max_split_size_mb:64",
+    )
+    monkeypatch.setattr(
+        expert_cache.torch._C,
+        "_accelerator_setAllocatorSettings",
+        applied.append,
+    )
+
+    expert_cache._configure_large_pinned_allocation(33 * 1024**2)
+
+    assert applied == [
+        "max_split_size_mb:64,pinned_max_round_threshold_mb:32,"
+        "pinned_max_cached_size_mb:32"
+    ]
+
+
+def test_small_streamed_host_store_keeps_allocator_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import expert_cache
+
+    applied: list[str] = []
+    monkeypatch.setattr(
+        expert_cache.torch._C,
+        "_accelerator_setAllocatorSettings",
+        applied.append,
+    )
+
+    expert_cache._configure_large_pinned_allocation(32 * 1024**2)
+
+    assert applied == []
+
+
+def test_prefetch_offloader_skips_streamed_expert_host_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.offloader import prefetch
+
+    module = torch.nn.Module()
+    module.register_parameter(
+        "resident",
+        torch.nn.Parameter(torch.zeros(1)),
+    )
+    streamed = torch.nn.Parameter(torch.zeros(1))
+    streamed._vllm_streamed_expert_host = True
+    module.register_parameter("streamed", streamed)
+
+    captured: list[list[str]] = []
+
+    class FakeModuleOffloader:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.append(kwargs["whitelist_param_names"])
+
+    monkeypatch.setattr(prefetch, "_ModuleOffloader", FakeModuleOffloader)
+    offloader = prefetch.PrefetchOffloader.__new__(prefetch.PrefetchOffloader)
+    offloader.group_size = 1
+    offloader.num_in_group = 1
+    offloader.offload_params = set()
+    offloader.mode = "cpu"
+    offloader.copy_stream = object()
+    offloader.module_offloaders = []
+    offloader._hook_module_forward = lambda index, layer: None
+
+    assert offloader.wrap_modules(iter((module,))) == [module]
+    assert captured == [["resident"]]
 
 
 def _make_unquantized_method_for_loading_tests():

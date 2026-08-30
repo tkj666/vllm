@@ -25,6 +25,7 @@ from vllm.config import (
     OffloadConfig,
     ParallelConfig,
     PoolerConfig,
+    PrefetchOffloadConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -79,8 +80,44 @@ def _make_expert_cache_vllm_config() -> SimpleNamespace:
         ),
         kernel_config=SimpleNamespace(moe_backend="auto"),
         weight_transfer_config=None,
+        speculative_config=None,
         max_concurrent_batches=1,
     )
+
+
+def _make_deepseek_v4_expert_cache_config() -> SimpleNamespace:
+    from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+
+    config = _make_expert_cache_vllm_config()
+    config.model_config.architecture = "DeepseekV4ForCausalLM"
+    config.model_config.hf_text_config = SimpleNamespace(
+        num_hidden_layers=43,
+        n_routed_experts=256,
+        mlp_only_layers=None,
+        decoder_sparse_step=1,
+        expert_dtype="fp4",
+        quantization_config={
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        },
+    )
+    config.quant_config = DeepseekV4FP8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+    )
+    config.load_config = LoadConfig(
+        load_format="safetensors",
+        safetensors_load_strategy="lazy",
+    )
+    config.kernel_config.moe_backend = "marlin"
+    return config
+
+
+def _enable_deepseek_v4_cache_platform(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_platform, "support_deep_gemm", lambda: True)
 
 
 def _set_nested_attr(obj: object, path: str, value: object) -> None:
@@ -157,6 +194,128 @@ def test_expert_cache_piecewise_config_adds_moe_split_ops(monkeypatch):
     assert splitting_ops.count("vllm::moe_forward_shared") == 1
 
 
+def test_expert_cache_accepts_deepseek_v4_fp4_marlin(monkeypatch):
+    _enable_deepseek_v4_cache_platform(monkeypatch)
+    config = _make_deepseek_v4_expert_cache_config()
+
+    VllmConfig._verify_expert_cache_config(config)
+
+
+def test_deepseek_v4_expert_cache_rejects_pre_hopper_gpu(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_platform, "support_deep_gemm", lambda: False)
+    config = _make_deepseek_v4_expert_cache_config()
+
+    with pytest.raises(ValueError, match="Hopper or Blackwell"):
+        VllmConfig._verify_expert_cache_config(config)
+
+
+def test_deepseek_v4_expert_cache_accepts_layerwise_prefetch_offload(monkeypatch):
+    _enable_deepseek_v4_cache_platform(monkeypatch)
+    config = _make_deepseek_v4_expert_cache_config()
+    config.offload_config = OffloadConfig(
+        offload_backend="prefetch",
+        prefetch=PrefetchOffloadConfig(
+            offload_group_size=1,
+            offload_num_in_group=1,
+            offload_prefetch_step=1,
+        ),
+        expert_cache_shared_size=16,
+    )
+
+    VllmConfig._verify_expert_cache_config(config)
+
+
+def test_deepseek_v4_expert_cache_rejects_partial_layer_offload(monkeypatch):
+    _enable_deepseek_v4_cache_platform(monkeypatch)
+    config = _make_deepseek_v4_expert_cache_config()
+    config.offload_config = OffloadConfig(
+        offload_backend="prefetch",
+        prefetch=PrefetchOffloadConfig(
+            offload_group_size=2,
+            offload_num_in_group=1,
+            offload_prefetch_step=1,
+        ),
+        expert_cache_shared_size=16,
+    )
+
+    with pytest.raises(ValueError, match="layerwise prefetch offloading"):
+        VllmConfig._verify_expert_cache_config(config)
+
+
+def test_expert_cache_uses_deepseek_n_routed_experts(monkeypatch):
+    _enable_deepseek_v4_cache_platform(monkeypatch)
+    config = _make_deepseek_v4_expert_cache_config()
+    config.model_config.hf_text_config.n_routed_experts = 257
+
+    with pytest.raises(ValueError, match="at most 256"):
+        VllmConfig._verify_expert_cache_config(config)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        ("quant_config", object(), "DeepseekV4FP8Config"),
+        (
+            "model_config.hf_text_config.expert_dtype",
+            "fp8",
+            "expert_dtype='fp4'",
+        ),
+        (
+            "model_config.hf_text_config.quantization_config",
+            {"moe_quant_algo": "NVFP4"},
+            "native MXFP4",
+        ),
+        ("quant_config.is_checkpoint_fp8_serialized", False, "serialized FP8"),
+        ("quant_config.activation_scheme", "static", "dynamic activations"),
+        ("quant_config.weight_block_size", [64, 64], "weight_block_size"),
+        (
+            "kernel_config.moe_backend",
+            "deep_gemm_mega_moe",
+            "MegaMoE",
+        ),
+        ("kernel_config.moe_backend", "auto", "explicit Marlin"),
+        (
+            "speculative_config",
+            SimpleNamespace(method="mtp"),
+            "speculative decoding or MTP",
+        ),
+        ("parallel_config.enable_expert_parallel", True, "expert parallelism"),
+    ],
+)
+def test_expert_cache_rejects_unsupported_deepseek_v4_config(
+    monkeypatch, path, value, match
+):
+    _enable_deepseek_v4_cache_platform(monkeypatch)
+    config = _make_deepseek_v4_expert_cache_config()
+    _set_nested_attr(config, path, value)
+
+    with pytest.raises(ValueError, match=match):
+        VllmConfig._verify_expert_cache_config(config)
+
+
+@pytest.mark.parametrize(
+    ("load_format", "load_strategy"),
+    [
+        ("auto", "lazy"),
+        ("pt", "lazy"),
+        ("safetensors", None),
+        ("safetensors", "eager"),
+        ("safetensors", "prefetch"),
+    ],
+)
+def test_expert_cache_requires_lazy_safetensors_for_deepseek_v4(
+    monkeypatch, load_format, load_strategy
+):
+    _enable_deepseek_v4_cache_platform(monkeypatch)
+    config = _make_deepseek_v4_expert_cache_config()
+    config.load_config.load_format = load_format
+    config.load_config.safetensors_load_strategy = load_strategy
+
+    with pytest.raises(ValueError, match="pinned expert store"):
+        VllmConfig._verify_expert_cache_config(config)
+
+
 @pytest.mark.parametrize(
     "load_format",
     [
@@ -208,8 +367,8 @@ def test_expert_cache_rejects_unsupported_loader_formats(monkeypatch, load_forma
         ),
         (
             "model_config.hf_text_config.num_experts",
-            993,
-            "at most 992",
+            257,
+            "at most 256",
         ),
         (
             "offload_config.expert_cache_per_layer_size",

@@ -8,6 +8,7 @@ Run `pytest tests/kernels/test_moe.py`.
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -38,18 +39,27 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation_supported,
 )
 from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+    CachedExpertLayer,
     _invoke_cudagraph_with_initial_replay,
+    _StreamedExpertCacheRuntime,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
+    mxfp4_w4a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.expert_cache import ExpertWeightBundle
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+    MarlinExperts,
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+    MoEPrepareAndFinalizeNoDPEPModular,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_use_td_hw_supported,
 )
@@ -1265,6 +1275,546 @@ class MarlinMoEWeightData:
             sort_indices=sort_indices,
             marlin_bias=marlin_bias,
         )
+
+
+def _make_pinned_marlin_bundles(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[int, ExpertWeightBundle]]:
+    offsets: dict[str, int] = {}
+    total_bytes = 0
+    for name, tensor in tensors.items():
+        element_size = tensor.element_size()
+        total_bytes = (total_bytes + element_size - 1) // element_size * element_size
+        offsets[name] = total_bytes
+        total_bytes += tensor.nbytes
+
+    owner = torch.empty(
+        total_bytes,
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=True,
+    )
+    storage = owner.untyped_storage()
+    host_tensors: dict[str, torch.Tensor] = {}
+    for name, tensor in tensors.items():
+        host = torch.empty(0, dtype=tensor.dtype, device="cpu").set_(
+            storage,
+            offsets[name] // tensor.element_size(),
+            tensor.shape,
+            tensor.stride(),
+        )
+        host.copy_(tensor)
+        host_tensors[name] = host
+
+    format_class = "mxfp4-marlin-v1"
+    bundles = {
+        expert_id: ExpertWeightBundle(
+            format_class,
+            {name: tensor[expert_id] for name, tensor in host_tensors.items()},
+        )
+        for expert_id in range(next(iter(host_tensors.values())).shape[0])
+    }
+    return owner, host_tensors, bundles
+
+
+@pytest.mark.parametrize("use_cudagraph", [False, True])
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+def test_streamed_marlin_mxfp4_waves_match_resident_experts(
+    use_cudagraph: bool,
+):
+    set_random_seed(11)
+    m, n, k, num_experts, topk = 8, 128, 256, 4, 2
+    dtype = torch.bfloat16
+    quant_type = scalar_types.float4_e2m1f
+
+    hidden_states = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w1 = torch.randn((num_experts, 2 * n, k), device="cuda", dtype=dtype) / 10
+    w2 = torch.randn((num_experts, k, n), device="cuda", dtype=dtype) / 10
+    w1_data = MarlinMoEWeightData.make(w1, quant_type, group_size=32)
+    w2_data = MarlinMoEWeightData.make(w2, quant_type, group_size=32)
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 0]] * 2,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_weights = torch.rand((m, topk), device="cuda", dtype=torch.float32)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    moe_config = make_dummy_moe_config(
+        num_experts=num_experts,
+        experts_per_token=topk,
+        hidden_dim=k,
+        intermediate_size=n,
+        in_dtype=dtype,
+        max_num_tokens=m,
+    )
+
+    resident_experts = MarlinExperts(
+        moe_config,
+        mxfp4_w4a16_moe_quant_config(
+            w1_scale=w1_data.scales,
+            w2_scale=w2_data.scales,
+        ),
+    )
+    _, _, runtime_n, _, _ = resident_experts.moe_problem_size(
+        hidden_states,
+        w1_data.qweight,
+        w2_data.qweight,
+        topk_ids,
+    )
+    workspace13_shape, workspace2_shape, _ = resident_experts.workspace_shapes(
+        M=m,
+        N=runtime_n,
+        K=k,
+        topk=topk,
+        global_num_experts=num_experts,
+        local_num_experts=num_experts,
+        expert_tokens_meta=None,
+        activation=MoEActivation.SILU,
+    )
+
+    def allocate_workspace(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.empty(shape, device="cuda", dtype=dtype)
+
+    expected = torch.empty((m, k), device="cuda", dtype=dtype)
+
+    def run_resident() -> None:
+        resident_experts.apply(
+            output=expected,
+            hidden_states=hidden_states,
+            w1=w1_data.qweight,
+            w2=w2_data.qweight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=num_experts,
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=allocate_workspace(workspace13_shape),
+            workspace2=allocate_workspace(workspace2_shape),
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+        )
+
+    arena_slots = 3
+    arena_w1 = torch.empty(
+        (arena_slots, *w1_data.qweight.shape[1:]),
+        device="cuda",
+        dtype=w1_data.qweight.dtype,
+    )
+    arena_w2 = torch.empty(
+        (arena_slots, *w2_data.qweight.shape[1:]),
+        device="cuda",
+        dtype=w2_data.qweight.dtype,
+    )
+    arena_w1_scale = torch.empty(
+        (arena_slots, *w1_data.scales.shape[1:]),
+        device="cuda",
+        dtype=w1_data.scales.dtype,
+    )
+    arena_w2_scale = torch.empty(
+        (arena_slots, *w2_data.scales.shape[1:]),
+        device="cuda",
+        dtype=w2_data.scales.dtype,
+    )
+    streamed_experts = MarlinExperts(
+        moe_config,
+        mxfp4_w4a16_moe_quant_config(
+            w1_scale=arena_w1_scale,
+            w2_scale=arena_w2_scale,
+        ),
+    )
+    expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
+    route_output = torch.full((m, topk, k), torch.nan, device="cuda", dtype=dtype)
+    actual = torch.empty_like(expected)
+    workspace13 = allocate_workspace(workspace13_shape)
+    workspace2 = allocate_workspace(workspace2_shape)
+    max_aligned_tokens = m * topk + max(num_experts, arena_slots) * 255
+    alignment_outputs = (
+        torch.empty(max_aligned_tokens, device="cuda", dtype=torch.int32),
+        torch.empty(max_aligned_tokens, device="cuda", dtype=torch.int32),
+        torch.empty(1, device="cuda", dtype=torch.int32),
+        torch.empty(
+            max(num_experts, arena_slots) + 1,
+            device="cuda",
+            dtype=torch.int32,
+        ),
+    )
+
+    def run_wave(*graph_tensors: torch.Tensor) -> torch.Tensor:
+        del graph_tensors
+        streamed_experts.apply_streamed_wave(
+            output=actual,
+            hidden_states=hidden_states,
+            w1=arena_w1,
+            w2=arena_w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=num_experts,
+            expert_map=expert_map,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            route_output=route_output,
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+            alignment_outputs=alignment_outputs,
+        )
+        return route_output
+
+    wave_runner = run_wave
+    if use_cudagraph:
+        wave_runner = CUDAGraphWrapper(
+            run_wave,
+            vllm_config,
+            CUDAGraphMode.PIECEWISE,
+            CUDAGraphOptions(
+                debug_log_enable=False,
+                gc_disable=True,
+                weak_ref_output=False,
+            ),
+        )
+
+    descriptor = BatchDescriptor(num_tokens=m)
+    graph_tensors = (
+        actual,
+        route_output,
+        hidden_states,
+        arena_w1,
+        arena_w2,
+        arena_w1_scale,
+        arena_w2_scale,
+        topk_weights,
+        topk_ids,
+        expert_map,
+        workspace13,
+        workspace2,
+        *streamed_experts.streamed_graph_tensors(),
+        *alignment_outputs,
+    )
+    graph_visible_ptrs = tuple(tensor.data_ptr() for tensor in graph_tensors)
+
+    def execute_all_waves() -> None:
+        route_output.fill_(torch.nan)
+        expected_written = torch.zeros_like(topk_ids, dtype=torch.bool)
+        for logical_expert in range(num_experts):
+            slot = logical_expert % arena_slots
+            arena_w1[slot].copy_(w1_data.qweight[logical_expert])
+            arena_w2[slot].copy_(w2_data.qweight[logical_expert])
+            arena_w1_scale[slot].copy_(w1_data.scales[logical_expert])
+            arena_w2_scale[slot].copy_(w2_data.scales[logical_expert])
+            expert_map.fill_(-1)
+            expert_map[logical_expert] = slot
+            with set_forward_context(
+                None,
+                vllm_config,
+                cudagraph_runtime_mode=(
+                    CUDAGraphMode.PIECEWISE if use_cudagraph else CUDAGraphMode.NONE
+                ),
+                batch_descriptor=descriptor,
+            ):
+                _invoke_cudagraph_with_initial_replay(wave_runner, *graph_tensors)
+            expected_written |= topk_ids == logical_expert
+            torch.testing.assert_close(
+                torch.isfinite(route_output).all(dim=-1),
+                expected_written,
+                atol=0,
+                rtol=0,
+            )
+            assert graph_visible_ptrs == tuple(
+                tensor.data_ptr() for tensor in graph_tensors
+            )
+        streamed_experts.finalize_streamed(route_output, actual)
+
+    with set_current_vllm_config(vllm_config):
+        run_resident()
+        execute_all_waves()
+        torch.testing.assert_close(actual, expected, atol=4e-2, rtol=0)
+
+        captured_graph = None
+        if use_cudagraph:
+            assert isinstance(wave_runner, CUDAGraphWrapper)
+            assert len(wave_runner.concrete_cudagraph_entries) == 1
+            captured_graph = wave_runner.concrete_cudagraph_entries[
+                descriptor
+            ].cudagraph
+            assert captured_graph is not None
+
+        hidden_states.copy_(torch.randn_like(hidden_states) / 10)
+        new_w1 = torch.randn_like(w1) / 10
+        new_w2 = torch.randn_like(w2) / 10
+        new_w1_data = MarlinMoEWeightData.make(new_w1, quant_type, group_size=32)
+        new_w2_data = MarlinMoEWeightData.make(new_w2, quant_type, group_size=32)
+        w1_data.qweight.copy_(new_w1_data.qweight)
+        w2_data.qweight.copy_(new_w2_data.qweight)
+        w1_data.scales.copy_(new_w1_data.scales)
+        w2_data.scales.copy_(new_w2_data.scales)
+        topk_ids.copy_(
+            torch.tensor(
+                [[3, 1], [0, 2], [1, 3], [2, 0]] * 2,
+                device="cuda",
+                dtype=torch.int32,
+            )
+        )
+        new_topk_weights = torch.rand_like(topk_weights)
+        new_topk_weights /= new_topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights.copy_(new_topk_weights)
+
+        run_resident()
+        execute_all_waves()
+        torch.testing.assert_close(actual, expected, atol=4e-2, rtol=0)
+
+        if use_cudagraph:
+            assert isinstance(wave_runner, CUDAGraphWrapper)
+            assert (
+                wave_runner.concrete_cudagraph_entries[descriptor].cudagraph
+                is captured_graph
+            )
+
+    assert arena_slots != num_experts
+    assert torch.isfinite(route_output).all()
+
+
+@pytest.mark.parametrize("use_cudagraph", [False, True])
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+def test_cached_marlin_mxfp4_copy_and_piecewise_replay(
+    use_cudagraph: bool,
+) -> None:
+    set_random_seed(19)
+    m, n, k, num_experts, topk = 8, 128, 256, 4, 2
+    dtype = torch.bfloat16
+    quant_type = scalar_types.float4_e2m1f
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+
+    w1 = torch.randn((num_experts, 2 * n, k), device=device, dtype=dtype) / 10
+    w2 = torch.randn((num_experts, k, n), device=device, dtype=dtype) / 10
+    w1_data = MarlinMoEWeightData.make(w1, quant_type, group_size=32)
+    w2_data = MarlinMoEWeightData.make(w2, quant_type, group_size=32)
+    resident_tensors = {
+        "w13_weight": w1_data.qweight,
+        "w2_weight": w2_data.qweight,
+        "w13_weight_scale": w1_data.scales,
+        "w2_weight_scale": w2_data.scales,
+    }
+    owner, host_tensors, host_bundles = _make_pinned_marlin_bundles(resident_tensors)
+    assert owner.is_pinned()
+    assert (
+        len({tensor.untyped_storage().data_ptr() for tensor in host_tensors.values()})
+        == 1
+    )
+
+    config = VllmConfig()
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            num_hidden_layers=1,
+            n_routed_experts=num_experts,
+            mlp_only_layers=None,
+            decoder_sparse_step=1,
+        )
+    )
+    config.offload_config.expert_cache_per_layer_size = 0
+    config.offload_config.expert_cache_shared_size = 2
+    config.offload_config.expert_cache_prefetch_policy = "none"
+    config.compilation_config.cudagraph_mode = (
+        CUDAGraphMode.PIECEWISE if use_cudagraph else CUDAGraphMode.NONE
+    )
+    runtime_specs = {
+        name: SimpleNamespace(shape=tensor.shape[1:], dtype=tensor.dtype)
+        for name, tensor in resident_tensors.items()
+    }
+    runtime = _StreamedExpertCacheRuntime(
+        config,
+        w1_data.qweight,
+        w2_data.qweight,
+        device,
+        object(),
+        format_class="mxfp4-marlin-v1",
+        runtime_specs=runtime_specs,
+        activation_dtype=dtype,
+        hidden_size=k,
+    )
+    binding = runtime.bind(0, host_bundles)
+    moe_config = make_dummy_moe_config(
+        num_experts=num_experts,
+        experts_per_token=topk,
+        hidden_dim=k,
+        intermediate_size=n,
+        in_dtype=dtype,
+        max_num_tokens=m,
+    )
+    resident_experts = MarlinExperts(
+        moe_config,
+        mxfp4_w4a16_moe_quant_config(
+            w1_scale=w1_data.scales,
+            w2_scale=w2_data.scales,
+        ),
+    )
+    streamed_kernel = FusedMoEKernel(
+        MoEPrepareAndFinalizeNoDPEPModular(),
+        MarlinExperts(
+            moe_config,
+            mxfp4_w4a16_moe_quant_config(
+                w1_scale=runtime.tensor("w13_weight_scale"),
+                w2_scale=runtime.tensor("w2_weight_scale"),
+            ),
+        ),
+    )
+    cached_layer = CachedExpertLayer(
+        runtime,
+        binding,
+        kernel=streamed_kernel,
+        activation=MoEActivation.SILU,
+        num_experts=num_experts,
+        max_num_tokens=m,
+        top_k=topk,
+    )
+    assert (
+        runtime._coordinator.copy_stream.cuda_stream
+        != torch.cuda.current_stream(device).cuda_stream
+    )
+
+    descriptor = BatchDescriptor(num_tokens=m)
+    runtime_mode = CUDAGraphMode.PIECEWISE if use_cudagraph else CUDAGraphMode.NONE
+
+    def run_case(
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        _, _, runtime_n, _, _ = resident_experts.moe_problem_size(
+            hidden_states,
+            w1_data.qweight,
+            w2_data.qweight,
+            topk_ids,
+        )
+        workspace13_shape, workspace2_shape, _ = resident_experts.workspace_shapes(
+            M=m,
+            N=runtime_n,
+            K=k,
+            topk=topk,
+            global_num_experts=num_experts,
+            local_num_experts=num_experts,
+            expert_tokens_meta=None,
+            activation=MoEActivation.SILU,
+        )
+        expected = torch.empty_like(hidden_states)
+        resident_experts.apply(
+            output=expected,
+            hidden_states=hidden_states,
+            w1=w1_data.qweight,
+            w2=w2_data.qweight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=num_experts,
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=torch.empty(
+                workspace13_shape,
+                device=device,
+                dtype=dtype,
+            ),
+            workspace2=torch.empty(
+                workspace2_shape,
+                device=device,
+                dtype=dtype,
+            ),
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+        )
+        graph_ptrs = cached_layer.graph_data_ptrs
+        with set_forward_context(
+            None,
+            config,
+            cudagraph_runtime_mode=runtime_mode,
+            batch_descriptor=descriptor,
+        ):
+            prepared = cached_layer.prepare(
+                streamed_kernel,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=num_experts,
+                apply_router_weight_on_input=False,
+                shared_experts=None,
+                shared_experts_input=None,
+            )
+            actual = cached_layer.execute(prepared)
+        torch.cuda.synchronize()
+        assert cached_layer.graph_data_ptrs == graph_ptrs
+        torch.testing.assert_close(actual, expected, atol=4e-2, rtol=0)
+
+    hidden_states = torch.randn((m, k), device=device, dtype=dtype) / 10
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 0]] * 2,
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.rand((m, topk), device=device, dtype=torch.float32)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+
+    compute_stream = torch.cuda.Stream(device=device)
+    with set_current_vllm_config(config), torch.cuda.stream(compute_stream):
+        run_case(hidden_states, topk_ids, topk_weights)
+        graph_ptrs = cached_layer.graph_data_ptrs
+        captured_graph = None
+        if use_cudagraph:
+            assert isinstance(cached_layer._wave_runner, CUDAGraphWrapper)
+            captured_graph = cached_layer._wave_runner.concrete_cudagraph_entries[
+                descriptor
+            ].cudagraph
+            assert captured_graph is not None
+
+        absent_experts = [
+            expert_id
+            for expert_id in range(num_experts)
+            if binding.slot_for(expert_id) is None
+        ]
+        assert len(absent_experts) == 2
+        new_w1 = torch.randn_like(w1) / 10
+        new_w2 = torch.randn_like(w2) / 10
+        new_w1_data = MarlinMoEWeightData.make(new_w1, quant_type, group_size=32)
+        new_w2_data = MarlinMoEWeightData.make(new_w2, quant_type, group_size=32)
+        new_tensors = {
+            "w13_weight": new_w1_data.qweight,
+            "w2_weight": new_w2_data.qweight,
+            "w13_weight_scale": new_w1_data.scales,
+            "w2_weight_scale": new_w2_data.scales,
+        }
+        for expert_id in absent_experts:
+            for name, tensor in new_tensors.items():
+                host_tensors[name][expert_id].copy_(tensor[expert_id])
+                resident_tensors[name][expert_id].copy_(tensor[expert_id])
+
+        first, second = absent_experts
+        topk_ids.copy_(
+            torch.tensor(
+                [[first, second], [second, first]] * (m // 2),
+                device=device,
+                dtype=torch.int32,
+            )
+        )
+        hidden_states.copy_(torch.randn_like(hidden_states) / 10)
+        new_topk_weights = torch.rand_like(topk_weights)
+        new_topk_weights /= new_topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights.copy_(new_topk_weights)
+        loads_before = cached_layer.stats.loads
+
+        run_case(hidden_states, topk_ids, topk_weights)
+
+        assert cached_layer.stats.loads == loads_before + 2
+        assert cached_layer.graph_data_ptrs == graph_ptrs
+        if use_cudagraph:
+            assert (
+                cached_layer._wave_runner.concrete_cudagraph_entries[
+                    descriptor
+                ].cudagraph
+                is captured_graph
+            )
 
 
 @pytest.mark.flaky(reruns=2)

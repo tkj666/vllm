@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     biased_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.expert_cache import (
+    allocate_streamed_expert_host_storage,
     get_streamed_expert_cache_load_token,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
@@ -56,18 +57,7 @@ def _align_up(value: int, alignment: int) -> int:
 
 
 def _allocate_pinned_storage(num_bytes: int) -> torch.UntypedStorage:
-    storage = (
-        torch.empty(
-            num_bytes,
-            dtype=torch.uint8,
-            device="cpu",
-        )
-        .pin_memory()
-        .untyped_storage()
-    )
-    if storage.nbytes() != num_bytes or not storage.is_pinned():
-        raise RuntimeError("failed to allocate the streamed expert host store")
-    return storage
+    return allocate_streamed_expert_host_storage(num_bytes)
 
 
 class _StreamedExpertHostStore:

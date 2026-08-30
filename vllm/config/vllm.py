@@ -1126,6 +1126,7 @@ class VllmConfig:
             raise ValueError("Streamed expert caching requires a model configuration.")
 
         supported_architectures = {
+            "DeepseekV4ForCausalLM",
             "Qwen3MoeForCausalLM",
             "Qwen3NextForCausalLM",
         }
@@ -1135,12 +1136,19 @@ class VllmConfig:
                 f"{sorted(supported_architectures)}, but got "
                 f"{model_config.architecture!r}."
             )
+        if self.speculative_config is not None:
+            raise ValueError(
+                "Streamed expert caching does not support speculative decoding or MTP."
+            )
         hf_config = model_config.hf_text_config
+        num_experts = getattr(hf_config, "num_experts", None)
+        if num_experts is None:
+            num_experts = getattr(hf_config, "n_routed_experts", 0)
         mlp_only_layers = set(getattr(hf_config, "mlp_only_layers", None) or ())
         sparse_step = getattr(hf_config, "decoder_sparse_step", 1)
         num_routed_moe_layers = sum(
             layer_id not in mlp_only_layers
-            and hf_config.num_experts > 0
+            and num_experts > 0
             and (layer_id + 1) % sparse_step == 0
             for layer_id in range(hf_config.num_hidden_layers)
         )
@@ -1148,24 +1156,70 @@ class VllmConfig:
             raise ValueError(
                 "Streamed expert caching requires at least one routed MoE layer."
             )
+        if num_experts > 256:
+            raise ValueError(
+                "Streamed expert caching supports at most 256 logical experts "
+                "per layer, but got "
+                f"{num_experts}."
+            )
         arena_size = (
             num_routed_moe_layers * expert_cache.expert_cache_per_layer_size
             + expert_cache.expert_cache_shared_size
         )
-        alignment_namespace = max(hf_config.num_experts, arena_size)
+        alignment_namespace = max(num_experts, arena_size)
         padded_alignment_namespace = ((alignment_namespace + 31) // 32) * 32
         if padded_alignment_namespace >= 1024:
             raise ValueError(
                 "Streamed expert caching supports at most 992 logical experts "
-                "or arena slots in the Triton alignment namespace, but got "
+                "or arena slots in the MoE alignment namespace, but got "
                 f"{alignment_namespace}."
             )
         if model_config.dtype != torch.bfloat16:
             raise ValueError(
-                "Streamed expert caching requires bfloat16 model weights, "
+                "Streamed expert caching requires bfloat16 routed activations, "
                 f"but got {model_config.dtype}."
             )
-        if self.quant_config is not None:
+        is_deepseek_v4 = model_config.architecture == "DeepseekV4ForCausalLM"
+        if is_deepseek_v4:
+            if not current_platform.support_deep_gemm():
+                raise ValueError(
+                    "DeepSeek V4 streamed expert caching requires a Hopper or "
+                    "Blackwell GPU because its attention path requires DeepGEMM."
+                )
+            from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+
+            if not isinstance(self.quant_config, DeepseekV4FP8Config):
+                raise ValueError(
+                    "DeepSeek V4 streamed expert caching requires DeepseekV4FP8Config."
+                )
+            if getattr(hf_config, "expert_dtype", None) != "fp4":
+                raise ValueError(
+                    "DeepSeek V4 streamed expert caching requires expert_dtype='fp4'."
+                )
+            hf_quant_config = getattr(hf_config, "quantization_config", None)
+            if not isinstance(hf_quant_config, dict):
+                raise ValueError(
+                    "DeepSeek V4 streamed expert caching requires a serialized "
+                    "FP8 checkpoint quantization_config."
+                )
+            moe_quant_algo = hf_quant_config.get("moe_quant_algo")
+            if moe_quant_algo:
+                raise ValueError(
+                    "DeepSeek V4 streamed expert caching only supports native "
+                    "MXFP4 experts; quantization_config.moe_quant_algo must be "
+                    "unset."
+                )
+            if (
+                not self.quant_config.is_checkpoint_fp8_serialized
+                or self.quant_config.activation_scheme != "dynamic"
+                or tuple(self.quant_config.weight_block_size or ()) != (128, 128)
+            ):
+                raise ValueError(
+                    "DeepSeek V4 streamed expert caching requires serialized "
+                    "FP8 linear weights with dynamic activations and "
+                    "weight_block_size=[128, 128]."
+                )
+        elif self.quant_config is not None:
             raise ValueError("Streamed expert caching does not support quantization.")
         if self.lora_config is not None:
             raise ValueError("Streamed expert caching does not support LoRA.")
@@ -1185,7 +1239,17 @@ class VllmConfig:
             "sharded_state",
         }
         load_format = self.load_config.load_format
-        if load_format not in supported_load_formats:
+        if is_deepseek_v4 and (
+            load_format != "safetensors"
+            or self.load_config.safetensors_load_strategy != "lazy"
+        ):
+            raise ValueError(
+                "DeepSeek V4 streamed expert caching requires "
+                "load_format='safetensors' and "
+                "safetensors_load_strategy='lazy' so the checkpoint is not "
+                "materialized alongside the pinned expert store."
+            )
+        if not is_deepseek_v4 and load_format not in supported_load_formats:
             raise ValueError(
                 "Streamed expert caching does not support model loader format "
                 f"{load_format!r}. Supported formats: "
@@ -1252,14 +1316,25 @@ class VllmConfig:
                 "disable async scheduling."
             )
 
-        if (
+        prefetch = expert_cache.prefetch
+        weight_offload_enabled = (
             expert_cache.offload_backend != "auto"
             or expert_cache.uva.cpu_offload_gb > 0
-            or expert_cache.prefetch.offload_group_size > 0
-        ):
+            or prefetch.offload_group_size > 0
+        )
+        layerwise_prefetch = (
+            is_deepseek_v4
+            and expert_cache.offload_backend in ("auto", "prefetch")
+            and expert_cache.uva.cpu_offload_gb == 0
+            and prefetch.offload_group_size == 1
+            and prefetch.offload_num_in_group == 1
+            and prefetch.offload_prefetch_step == 1
+        )
+        if weight_offload_enabled and not layerwise_prefetch:
             raise ValueError(
                 "Streamed expert caching cannot be combined with model weight "
-                "offloading."
+                "offloading except for DeepSeek V4 layerwise prefetch offloading "
+                "with group_size=1, num_in_group=1, and prefetch_step=1."
             )
         if self.weight_transfer_config is not None:
             raise ValueError(
@@ -1269,10 +1344,17 @@ class VllmConfig:
             raise ValueError(
                 "Streamed expert caching does not support model sleep mode."
             )
-        if self.kernel_config.moe_backend not in ("auto", "triton"):
+        moe_backend = self.kernel_config.moe_backend
+        if is_deepseek_v4 and moe_backend != "marlin":
+            raise ValueError(
+                "DeepSeek V4 streamed expert caching requires the explicit "
+                f"Marlin MoE backend, but got {moe_backend!r}; auto selection, "
+                "expert parallel, and MegaMoE backends are not supported."
+            )
+        if not is_deepseek_v4 and moe_backend not in ("auto", "triton"):
             raise ValueError(
                 "Streamed expert caching requires the Triton MoE backend, but got "
-                f"{self.kernel_config.moe_backend!r}."
+                f"{moe_backend!r}."
             )
 
         cudagraph_mode = self.compilation_config.cudagraph_mode

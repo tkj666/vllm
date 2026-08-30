@@ -573,6 +573,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         mxfp4_block = 32
 
+        from vllm.model_executor.layers.fused_moe.mxfp4_expert_cache import (
+            streamed_mxfp4_cache_enabled,
+            streamed_mxfp4_weight_views,
+        )
+
+        use_streamed_cache = streamed_mxfp4_cache_enabled()
+        if use_streamed_cache:
+            if self.mxfp4_backend != Mxfp4MoeBackend.MARLIN:
+                raise ValueError(
+                    "streamed MXFP4 expert caching requires the standard "
+                    f"Marlin backend, but selected {self.mxfp4_backend.value!r}"
+                )
+            if self.moe.has_bias:
+                raise ValueError(
+                    "streamed MXFP4 expert caching does not support expert bias"
+                )
+
         layer.params_dtype = params_dtype
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
@@ -580,29 +597,54 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.pop("weight_loader")
         scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
 
+        streamed_views = (
+            streamed_mxfp4_weight_views(
+                layer,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size_per_partition,
+                w13_num_shards=self.moe.w13_num_shards,
+                activation_dtype=params_dtype,
+            )
+            if use_streamed_cache
+            else None
+        )
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
-            torch.zeros(
-                num_experts,
-                self.moe.w13_num_shards * intermediate_size_per_partition,
-                hidden_size // 2,
-                dtype=weight_dtype,
+            (
+                streamed_views["w13_weight"]
+                if streamed_views is not None
+                else torch.zeros(
+                    num_experts,
+                    self.moe.w13_num_shards * intermediate_size_per_partition,
+                    hidden_size // 2,
+                    dtype=weight_dtype,
+                )
             ),
             requires_grad=False,
         )
+        if use_streamed_cache:
+            w13_weight._vllm_streamed_expert_host = True
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
         set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
 
         w13_weight_scale = torch.nn.Parameter(
-            torch.zeros(
-                num_experts,
-                self.moe.w13_num_shards * intermediate_size_per_partition,
-                hidden_size // mxfp4_block,
-                dtype=scale_dtype,
+            (
+                streamed_views["w13_weight_scale"]
+                if streamed_views is not None
+                else torch.zeros(
+                    num_experts,
+                    self.moe.w13_num_shards * intermediate_size_per_partition,
+                    hidden_size // mxfp4_block,
+                    dtype=scale_dtype,
+                )
             ),
             requires_grad=False,
         )
+        if use_streamed_cache:
+            w13_weight_scale._vllm_streamed_expert_host = True
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         set_weight_attrs(w13_weight_scale, {"weight_loader": scale_weight_loader})
@@ -610,27 +652,39 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
-            torch.zeros(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition // 2,
-                dtype=weight_dtype,
+            (
+                streamed_views["w2_weight"]
+                if streamed_views is not None
+                else torch.zeros(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // 2,
+                    dtype=weight_dtype,
+                )
             ),
             requires_grad=False,
         )
+        if use_streamed_cache:
+            w2_weight._vllm_streamed_expert_host = True
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
         set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.zeros(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition // mxfp4_block,
-                dtype=scale_dtype,
+            (
+                streamed_views["w2_weight_scale"]
+                if streamed_views is not None
+                else torch.zeros(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // mxfp4_block,
+                    dtype=scale_dtype,
+                )
             ),
             requires_grad=False,
         )
+        if use_streamed_cache:
+            w2_weight_scale._vllm_streamed_expert_host = True
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
         set_weight_attrs(w2_weight_scale, {"weight_loader": scale_weight_loader})
@@ -774,6 +828,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
+        from vllm.model_executor.layers.fused_moe.mxfp4_expert_cache import (
+            streamed_mxfp4_cache_enabled,
+        )
+
+        if streamed_mxfp4_cache_enabled():
+            self._process_streamed_weights_after_loading(layer)
+            return
+
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
@@ -785,6 +847,57 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+
+    def _process_streamed_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if self.moe_kernel is not None:
+            raise RuntimeError(
+                "streamed MXFP4 expert caching does not support hot weight updates"
+            )
+        if self.mxfp4_backend != Mxfp4MoeBackend.MARLIN:
+            raise ValueError(
+                "streamed MXFP4 expert caching requires the standard Marlin "
+                f"backend, but selected {self.mxfp4_backend.value!r}"
+            )
+
+        from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+            bind_streamed_expert_layer,
+        )
+        from vllm.model_executor.layers.fused_moe.mxfp4_expert_cache import (
+            convert_streamed_mxfp4_layer,
+        )
+
+        device = torch.device(layer.moe_config.device)
+        if device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+        streamed_weights = convert_streamed_mxfp4_layer(layer, device)
+        layer._streamed_mxfp4_weights = streamed_weights
+
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        self.moe_quant_config = make_mxfp4_moe_quant_config(
+            mxfp4_backend=self.mxfp4_backend,
+            w1_scale=streamed_weights.runtime_tensor("w13_weight_scale"),
+            w2_scale=streamed_weights.runtime_tensor("w2_weight_scale"),
+            swiglu_limit=swiglu_limit,
+            layer=layer,
+        )
+        assert self.moe_quant_config is not None
+        assert self.experts_cls is not None
+        self.moe_kernel = make_mxfp4_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            mxfp4_backend=self.mxfp4_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._expert_routing_tables(),
+        )
+        layer.cached_expert_layer = bind_streamed_expert_layer(
+            layer,
+            self.moe_kernel,
+            streamed_weights=streamed_weights,
+        )
+
+        self.moe_quant_config._w1.scale = layer.w13_weight_scale
+        self.moe_quant_config._w2.scale = layer.w2_weight_scale
+        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(
         self,
@@ -846,6 +959,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+        cached_layer = getattr(layer, "cached_expert_layer", None)
+        if cached_layer is not None:
+            prepared = cached_layer.prepare(
+                self.moe_kernel,
+                x,
+                topk_weights,
+                topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
+            return cached_layer.execute(prepared)
         return self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,

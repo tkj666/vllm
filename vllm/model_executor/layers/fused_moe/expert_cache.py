@@ -25,6 +25,54 @@ from vllm.utils.native_cuda_copy_scheduler import (
 
 ExpertCacheKey: TypeAlias = tuple[int, int, str]
 
+_PINNED_ALLOCATOR_LIMIT_MB = 32
+_PINNED_ALLOCATOR_LIMIT_BYTES = _PINNED_ALLOCATOR_LIMIT_MB * 1024**2
+_PINNED_ALLOCATOR_CONFIG_LOCK = threading.Lock()
+
+
+def _configure_large_pinned_allocation(num_bytes: int) -> None:
+    if num_bytes <= _PINNED_ALLOCATOR_LIMIT_BYTES:
+        return
+
+    get_settings = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+    set_settings = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if get_settings is None or set_settings is None:
+        raise RuntimeError(
+            "streamed expert host storage requires PyTorch pinned allocator "
+            "size-limit settings"
+        )
+
+    overrides = (
+        f"pinned_max_round_threshold_mb:{_PINNED_ALLOCATOR_LIMIT_MB},"
+        f"pinned_max_cached_size_mb:{_PINNED_ALLOCATOR_LIMIT_MB}"
+    )
+    with _PINNED_ALLOCATOR_CONFIG_LOCK:
+        current = get_settings()
+        settings = f"{current},{overrides}" if current else overrides
+        try:
+            set_settings(settings)
+        except (RuntimeError, ValueError) as error:
+            raise RuntimeError(
+                "failed to configure exact-size allocation for the streamed "
+                "expert host storage"
+            ) from error
+
+
+def allocate_streamed_expert_host_storage(num_bytes: int) -> torch.UntypedStorage:
+    """Allocate one exact-size PyTorch-pinned expert host storage."""
+    if num_bytes <= 0:
+        raise ValueError("streamed expert host storage must be non-empty")
+    _configure_large_pinned_allocation(num_bytes)
+    storage = torch.empty(
+        num_bytes,
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=True,
+    ).untyped_storage()
+    if storage.nbytes() != num_bytes or not storage.is_pinned():
+        raise RuntimeError("failed to allocate the streamed expert host storage")
+    return storage
+
 
 class _StreamedExpertCacheLoadToken:
     pass

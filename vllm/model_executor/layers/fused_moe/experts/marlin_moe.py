@@ -265,6 +265,11 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
+    route_output: torch.Tensor | None = None,
+    ignore_invalid_experts: bool = True,
+    alignment_outputs: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+    ) = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -337,13 +342,41 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
+    sorted_ids_out = None
+    expert_ids_out = None
+    num_tokens_post_pad_out = None
+    cumsum_out = None
+    if alignment_outputs is not None:
+        (
+            sorted_ids_out,
+            expert_ids_out,
+            num_tokens_post_pad_out,
+            cumsum_out,
+        ) = alignment_outputs
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,
         block_size_m,
         global_num_experts,
         expert_map,
-        ignore_invalid_experts=True,
+        ignore_invalid_experts=ignore_invalid_experts,
+        sorted_ids_out=sorted_ids_out,
+        expert_ids_out=expert_ids_out,
+        num_tokens_post_pad_out=num_tokens_post_pad_out,
+        cumsum_out=cumsum_out,
     )
+
+    route_shape = (hidden_states.shape[0], topk, K)
+    if route_output is not None and (
+        route_output.shape != route_shape
+        or route_output.dtype != hidden_states.dtype
+        or route_output.device != hidden_states.device
+        or not route_output.is_contiguous()
+    ):
+        raise ValueError(
+            "route_output must be a contiguous tensor with shape "
+            f"{route_shape}, dtype {hidden_states.dtype}, and device "
+            f"{hidden_states.device}"
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -380,10 +413,13 @@ def fused_marlin_moe(
         workspace=workspace,
         intermediate_cache13=intermediate_cache13,
         intermediate_cache2=intermediate_cache2,
-        output=None,
+        output=(None if route_output is None else route_output.view(-1, K)),
         input_dtype=input_dtype,
         is_k_full=is_k_full,
-    ).view(-1, topk, K)
+    ).view(route_shape)
+
+    if route_output is not None:
+        return moe_output
 
     if output is None:
         output = torch.empty_like(hidden_states)
@@ -600,6 +636,14 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+        device = torch.device(moe_config.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+        self.workspace = marlin_make_workspace_new(device, max_blocks_per_sm=4)
+
+    def streamed_graph_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return persistent tensors captured by a streamed wave graph."""
+        return (self.workspace,)
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -791,6 +835,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 sort_indices2=self.w2_g_idx_sort_indices,
                 is_k_full=self.is_k_full,
                 input_dtype=self.input_dtype,
+                workspace=self.workspace,
             )
             return
 
@@ -906,7 +951,78 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
+            workspace=self.workspace,
         )
+
+    def apply_streamed_wave(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        route_output: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+        alignment_outputs: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ) -> None:
+        """Execute one expert-map wave without reducing its route outputs."""
+        if self._lora_context is not None:
+            raise RuntimeError("streamed Marlin MoE does not support LoRA")
+        assert self.w1_scale is not None
+        assert self.w2_scale is not None
+        fused_marlin_moe(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            bias1=self.w1_bias,
+            bias2=self.w2_bias,
+            w1_scale=self.w1_scale,
+            w2_scale=self.w2_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            global_scale1=self.g1_alphas,
+            global_scale2=self.g2_alphas,
+            input_global_scale1=self.a1_gscale,
+            input_global_scale2=self.a2_gscale,
+            w1_zeros=self.w1_zp,
+            w2_zeros=self.w2_zp,
+            quant_type_id=self.quant_type_id,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            activation=activation,
+            activation_func=self.activation,
+            activation_config=self.activation_config,
+            expert_map=expert_map,
+            output=output,
+            route_output=route_output,
+            ignore_invalid_experts=True,
+            alignment_outputs=alignment_outputs,
+            intermediate_cache13=workspace2,
+            intermediate_cache2=workspace13,
+            g_idx1=self.w13_g_idx,
+            g_idx2=self.w2_g_idx,
+            sort_indices1=self.w13_g_idx_sort_indices,
+            sort_indices2=self.w2_g_idx_sort_indices,
+            is_k_full=self.is_k_full,
+            input_dtype=self.input_dtype,
+            workspace=self.workspace,
+        )
+
+    @staticmethod
+    def finalize_streamed(route_output: torch.Tensor, output: torch.Tensor) -> None:
+        """Reduce routes once after every streamed wave has completed."""
+        ops.moe_sum(route_output, output)
 
     def moe_sum(
         self,
@@ -1051,4 +1167,5 @@ class BatchedMarlinExperts(MarlinExpertsBase):
             is_k_full=self.is_k_full,
             activation_func=activation_func,
             activation_config=self.activation_config,
+            workspace=self.workspace,
         )
