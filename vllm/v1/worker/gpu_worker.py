@@ -93,6 +93,14 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _suspend_streamed_expert_cache_prefetch() -> AbstractContextManager[None]:
+    from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+        suspend_streamed_expert_cache_prefetch,
+    )
+
+    return suspend_streamed_expert_cache_prefetch()
+
+
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
     return (
@@ -537,7 +545,8 @@ class Worker(WorkerBase):
             current_platform.is_cuda_alike()
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
-            cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+            with _suspend_streamed_expert_cache_prefetch():
+                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
@@ -742,7 +751,8 @@ class Worker(WorkerBase):
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            with _suspend_streamed_expert_cache_prefetch():
+                cuda_graph_memory_bytes = self.model_runner.capture_model()
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (

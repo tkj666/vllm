@@ -2251,6 +2251,18 @@ def moe_sum(
     torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
 
 
+def moe_update_expert_map(
+    expert_map: torch.Tensor,
+    expert_ids: list[int],
+    slot_indices: list[int],
+) -> None:
+    torch.ops._moe_C.moe_update_expert_map(
+        expert_map,
+        expert_ids,
+        slot_indices,
+    )
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     num_experts: int,
@@ -2259,6 +2271,7 @@ def moe_align_block_size(
     experts_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
     expert_map: torch.Tensor | None = None,
+    cumsum_buffer: torch.Tensor | None = None,
 ) -> None:
     torch.ops._moe_C.moe_align_block_size(
         topk_ids,
@@ -2268,6 +2281,7 @@ def moe_align_block_size(
         experts_ids,
         num_tokens_post_pad,
         expert_map,
+        cumsum_buffer,
     )
 
 

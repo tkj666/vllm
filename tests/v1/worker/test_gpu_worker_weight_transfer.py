@@ -7,13 +7,15 @@ delegates to the configured weight transfer engine and tracks whether an update
 session is active. These tests verify that delegation and the session guard.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.lora.layers import BaseLayerWithLoRA
-from vllm.v1.worker.gpu_model_runner import _get_parameter_for_reload
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner, _get_parameter_for_reload
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -80,6 +82,22 @@ def test_reload_weights_sets_current_config():
     Worker.reload_weights(worker)
 
     assert model_runner.seen_config is worker.vllm_config
+
+
+def test_expert_cache_rejects_reload_before_consuming_weights():
+    runner = object.__new__(GPUModelRunner)
+    runner.offload_config = SimpleNamespace(expert_cache_enabled=True)
+    consumed = False
+
+    def weights_iterator():
+        nonlocal consumed
+        consumed = True
+        yield "weight", torch.ones(1)
+
+    with pytest.raises(RuntimeError, match="does not support hot weight updates"):
+        runner.reload_weights(weights_iterator=weights_iterator())
+
+    assert consumed is False
 
 
 def test_reload_parameter_lookup_preserves_lora_module_names():

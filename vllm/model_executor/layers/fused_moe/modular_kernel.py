@@ -117,6 +117,81 @@ class ExpertTokensMetadata:
         )
 
 
+@dataclass
+class PreparedStreamedMoEBatch:
+    """Prepared inputs and stable workspaces for streamed expert waves."""
+
+    output: torch.Tensor
+    route_output: torch.Tensor
+    hidden_states: torch.Tensor
+    a1q: torch.Tensor
+    a1q_scale: torch.Tensor | None
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    workspace13: torch.Tensor
+    workspace2: torch.Tensor
+    expert_tokens_meta: ExpertTokensMetadata | None
+    activation: MoEActivation
+    global_num_experts: int
+    apply_router_weight_on_input: bool
+    shared_experts: SharedExperts | None
+    shared_experts_input: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class StreamedMoEBuffers:
+    """Fixed-address workspaces and outputs reused by streamed MoE layers."""
+
+    workspace13: torch.Tensor
+    workspace2: torch.Tensor
+    route_output: torch.Tensor
+    output: torch.Tensor
+
+
+def _streamed_workspace_view(
+    buffer: torch.Tensor,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    required_numel = prod(shape)
+    if (
+        buffer.dtype != dtype
+        or buffer.device != device
+        or not buffer.is_contiguous()
+        or buffer.numel() < required_numel
+    ):
+        raise ValueError(
+            f"streamed {name} must be a contiguous {dtype} tensor on {device} "
+            f"with at least {required_numel} elements"
+        )
+    return buffer.flatten()[:required_numel].view(shape)
+
+
+def _streamed_output_view(
+    buffer: torch.Tensor,
+    num_tokens: int,
+    trailing_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if (
+        buffer.dtype != dtype
+        or buffer.device != device
+        or not buffer.is_contiguous()
+        or buffer.ndim != len(trailing_shape) + 1
+        or buffer.shape[0] < num_tokens
+        or tuple(buffer.shape[1:]) != trailing_shape
+    ):
+        raise ValueError(
+            f"streamed {name} must be a contiguous {dtype} tensor on {device} "
+            f"with shape [at least {num_tokens}, {', '.join(map(str, trailing_shape))}]"
+        )
+    return buffer[:num_tokens]
+
+
 class TopKWeightAndReduce(ABC):
     """
     An abstract base class for weight application and reduction implementations.
@@ -1434,6 +1509,236 @@ class FusedMoEKernelModularImpl:
 
         return output
 
+    def create_streamed_buffers(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+    ) -> StreamedMoEBuffers:
+        """Allocate maximum-size buffers before streamed graph capture."""
+        _, num_tokens, intermediate_size, hidden_size, top_k = (
+            self.fused_experts.moe_problem_size(hidden_states, w1, w2, topk_ids)
+        )
+        if num_tokens <= 0:
+            raise ValueError("streamed MoE buffer capacity must be positive")
+        workspace_dtype = self.fused_experts.workspace_dtype(hidden_states.dtype)
+        workspace13_shape, workspace2_shape, output_shape = (
+            self.fused_experts.workspace_shapes(
+                num_tokens,
+                intermediate_size,
+                hidden_size,
+                top_k,
+                global_num_experts,
+                global_num_experts,
+                None,
+                activation,
+            )
+        )
+        can_alias_output = workspace_dtype == hidden_states.dtype
+        common_numel = prod(workspace13_shape)
+        if can_alias_output:
+            common_numel = max(common_numel, prod(output_shape))
+        common = torch.empty(
+            (common_numel,),
+            dtype=workspace_dtype,
+            device=hidden_states.device,
+        )
+        return StreamedMoEBuffers(
+            workspace13=common,
+            workspace2=torch.empty(
+                (prod(workspace2_shape),),
+                dtype=workspace_dtype,
+                device=hidden_states.device,
+            ),
+            route_output=torch.empty(
+                (num_tokens, top_k, hidden_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            ),
+            output=(
+                common[: prod(output_shape)].view(output_shape)
+                if can_alias_output
+                else torch.empty(
+                    output_shape,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            ),
+        )
+
+    def prepare_streamed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        apply_router_weight_on_input: bool,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
+        buffers: StreamedMoEBuffers | None = None,
+    ) -> PreparedStreamedMoEBatch:
+        """Prepare routing once and allocate workspaces shared by all waves."""
+        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            None,
+            apply_router_weight_on_input,
+        )
+
+        _, num_tokens, intermediate_size, hidden_size, top_k = (
+            self.fused_experts.moe_problem_size(a1q, w1, w2, topk_ids)
+        )
+        workspace_dtype = self.fused_experts.workspace_dtype(hidden_states.dtype)
+        workspace13_shape, workspace2_shape, _ = self.fused_experts.workspace_shapes(
+            num_tokens,
+            intermediate_size,
+            hidden_size,
+            top_k,
+            global_num_experts,
+            global_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
+        if buffers is not None:
+            workspace13 = _streamed_workspace_view(
+                buffers.workspace13,
+                workspace13_shape,
+                workspace_dtype,
+                hidden_states.device,
+                "workspace13",
+            )
+            workspace2 = _streamed_workspace_view(
+                buffers.workspace2,
+                workspace2_shape,
+                workspace_dtype,
+                hidden_states.device,
+                "workspace2",
+            )
+            route_output = _streamed_output_view(
+                buffers.route_output,
+                num_tokens,
+                (top_k, hidden_size),
+                hidden_states.dtype,
+                hidden_states.device,
+                "route_output",
+            )
+            output = _streamed_output_view(
+                buffers.output,
+                num_tokens,
+                (hidden_size,),
+                hidden_states.dtype,
+                hidden_states.device,
+                "output",
+            )
+        elif num_tokens == 0:
+            workspace13 = torch.empty(
+                workspace13_shape,
+                dtype=workspace_dtype,
+                device=hidden_states.device,
+            )
+            workspace2 = torch.empty(
+                workspace2_shape,
+                dtype=workspace_dtype,
+                device=hidden_states.device,
+            )
+            route_output = hidden_states.new_empty((0, top_k, hidden_size))
+            output = hidden_states.new_empty((0, hidden_size))
+        else:
+            workspace13, workspace2, route_output, output = (
+                current_workspace_manager().get_simultaneous(
+                    (workspace13_shape, workspace_dtype),
+                    (workspace2_shape, workspace_dtype),
+                    (
+                        (num_tokens, top_k, hidden_size),
+                        hidden_states.dtype,
+                    ),
+                    ((num_tokens, hidden_size), hidden_states.dtype),
+                )
+            )
+
+        return PreparedStreamedMoEBatch(
+            output=output,
+            route_output=route_output,
+            hidden_states=hidden_states,
+            a1q=a1q,
+            a1q_scale=a1q_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_tokens_meta=expert_tokens_meta,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+        )
+
+    def execute_streamed_wave(
+        self,
+        batch: PreparedStreamedMoEBatch,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        expert_map: torch.Tensor,
+        alignment_outputs: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ) -> None:
+        """Execute one wave into its original top-k route positions."""
+        apply_wave = getattr(self.fused_experts, "apply_streamed_wave", None)
+        if apply_wave is None:
+            raise RuntimeError(
+                f"{type(self.fused_experts).__name__} does not support "
+                "streamed expert waves"
+            )
+        apply_wave(
+            output=batch.output,
+            hidden_states=batch.a1q,
+            w1=w1,
+            w2=w2,
+            topk_weights=batch.topk_weights,
+            topk_ids=batch.topk_ids,
+            activation=batch.activation,
+            global_num_experts=batch.global_num_experts,
+            expert_map=expert_map,
+            a1q_scale=batch.a1q_scale,
+            a2_scale=self.fused_experts.a2_scale,
+            workspace13=batch.workspace13,
+            workspace2=batch.workspace2,
+            route_output=batch.route_output,
+            expert_tokens_meta=batch.expert_tokens_meta,
+            apply_router_weight_on_input=batch.apply_router_weight_on_input,
+            alignment_outputs=alignment_outputs,
+        )
+
+    def finalize_streamed(self, batch: PreparedStreamedMoEBatch) -> torch.Tensor:
+        """Reduce route outputs and finalize once after all waves."""
+        finalize = getattr(self.fused_experts, "finalize_streamed", None)
+        if finalize is None:
+            raise RuntimeError(
+                f"{type(self.fused_experts).__name__} does not support "
+                "streamed expert waves"
+            )
+        finalize(batch.route_output, batch.output)
+        return self._finalize(
+            batch.output,
+            batch.output,
+            batch.hidden_states,
+            batch.topk_weights,
+            batch.topk_ids,
+            batch.apply_router_weight_on_input,
+            shared_experts=batch.shared_experts,
+            shared_experts_input=batch.shared_experts_input,
+        )
+
     def apply(
         self,
         hidden_states: torch.Tensor,
@@ -1713,6 +2018,77 @@ class FusedMoEKernel:
             routed_scaling_factor=routed_scaling_factor,
             topk_group=topk_group,
         )
+
+    def create_streamed_buffers(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+    ) -> StreamedMoEBuffers:
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.create_streamed_buffers(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+        )
+
+    def prepare_streamed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        apply_router_weight_on_input: bool,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+        buffers: StreamedMoEBuffers | None = None,
+    ) -> PreparedStreamedMoEBatch:
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.prepare_streamed(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+            buffers=buffers,
+        )
+
+    def execute_streamed_wave(
+        self,
+        batch: PreparedStreamedMoEBatch,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        expert_map: torch.Tensor,
+        alignment_outputs: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ) -> None:
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        self.impl.execute_streamed_wave(
+            batch=batch,
+            w1=w1,
+            w2=w2,
+            expert_map=expert_map,
+            alignment_outputs=alignment_outputs,
+        )
+
+    def finalize_streamed(self, batch: PreparedStreamedMoEBatch) -> torch.Tensor:
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.finalize_streamed(batch)
 
     def apply(
         self,

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager, nullcontext
 
 import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
@@ -50,7 +51,18 @@ class BaseModelLoader(ABC):
             device_config.device if load_config.device is None else load_config.device
         )
         target_device = torch.device(load_device)
-        with set_default_torch_dtype(model_config.dtype):
+        expert_cache_load_context: AbstractContextManager[None] = nullcontext()
+        if vllm_config.offload_config.expert_cache_enabled:
+            from vllm.model_executor.layers.fused_moe.expert_cache import (
+                streamed_expert_cache_load_context,
+            )
+
+            expert_cache_load_context = streamed_expert_cache_load_context()
+        with (
+            set_default_torch_dtype(model_config.dtype),
+            set_current_vllm_config(vllm_config, prefix=prefix),
+            expert_cache_load_context,
+        ):
             with target_device:
                 model = initialize_model(
                     vllm_config=vllm_config,

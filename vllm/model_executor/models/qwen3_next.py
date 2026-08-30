@@ -144,6 +144,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 prefix,
                 shared_expert_name="shared_expert",
             )
+        if (
+            vllm_config.offload_config.expert_cache_enabled
+            and self.is_fused_shared_expert_enabled
+        ):
+            raise ValueError(
+                "streamed expert caching does not support fused shared experts"
+            )
 
         if (
             self.is_fused_shared_expert_enabled

@@ -4,6 +4,7 @@
 import json
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
+from inspect import signature
 from typing import Annotated, Literal
 
 import pytest
@@ -24,6 +25,41 @@ from vllm.engine.arg_utils import (
     parse_type,
 )
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+
+def test_expert_cache_cli_and_llm_api():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(exit_on_error=False))
+    parsed = parser.parse_args(
+        [
+            "--expert-cache-per-layer-size",
+            "8",
+            "--expert-cache-shared-size",
+            "64",
+            "--expert-cache-policy",
+            "fifo",
+            "--expert-cache-prefetch-policy",
+            "dummy",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(parsed)
+
+    assert engine_args.expert_cache_per_layer_size == 8
+    assert engine_args.expert_cache_shared_size == 64
+    assert engine_args.expert_cache_policy == "fifo"
+    assert engine_args.expert_cache_prefetch_policy == "dummy"
+
+    from vllm.entrypoints.llm import LLM
+
+    parameters = signature(LLM.__init__).parameters
+    assert parameters["expert_cache_per_layer_size"].default == 0
+    assert parameters["expert_cache_shared_size"].default == 0
+    assert parameters["expert_cache_policy"].default == "fifo"
+    assert parameters["expert_cache_prefetch_policy"].default == "none"
+
+    with pytest.raises(ArgumentError):
+        parser.parse_args(["--expert-cache-policy", "lru"])
+    with pytest.raises(ArgumentError):
+        parser.parse_args(["--expert-cache-prefetch-policy", "oracle"])
 
 
 @pytest.mark.parametrize(

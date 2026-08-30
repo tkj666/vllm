@@ -622,10 +622,14 @@ class MoERunner(MoERunnerInterface):
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
         )
 
-        return (
-            self._shared_experts.output if self._shared_experts is not None else None,
-            fused_out,
+        shared_output = (
+            self._shared_experts.output if self._shared_experts is not None else None
         )
+        cached_expert_layer = getattr(self.routed_experts, "cached_expert_layer", None)
+        if shared_output is not None and cached_expert_layer is not None:
+            shared_output = cached_expert_layer.stage_shared_output(shared_output)
+
+        return shared_output, fused_out
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token

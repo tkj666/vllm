@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 from torch import nn
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, get_current_vllm_config
 from vllm.config.load import LoadConfig
+from vllm.model_executor.layers.fused_moe.expert_cache import (
+    get_streamed_expert_cache_load_token,
+)
+from vllm.model_executor.model_loader import base_loader as base_loader_module
 from vllm.model_executor.model_loader import get_model_loader, register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
@@ -26,6 +33,101 @@ class CustomModelLoader(BaseModelLoader):
 def test_register_model_loader():
     load_config = LoadConfig(load_format="custom_load_format")
     assert isinstance(get_model_loader(load_config), CustomModelLoader)
+
+
+def test_base_loader_sets_config_during_post_load(monkeypatch):
+    load_config = LoadConfig(load_format="custom_load_format")
+    vllm_config = SimpleNamespace(
+        device_config=SimpleNamespace(device="cpu"),
+        load_config=load_config,
+        offload_config=SimpleNamespace(expert_cache_enabled=False),
+    )
+    model_config = SimpleNamespace(dtype=torch.float32)
+    model = nn.Linear(1, 1)
+    seen_config = None
+
+    monkeypatch.setattr(
+        base_loader_module,
+        "initialize_model",
+        lambda **kwargs: model,
+    )
+    monkeypatch.setattr(
+        base_loader_module,
+        "current_platform",
+        SimpleNamespace(is_cuda_alike=lambda: False, is_xpu=lambda: False),
+    )
+
+    def record_post_load(*args):
+        nonlocal seen_config
+        seen_config = get_current_vllm_config()
+
+    monkeypatch.setattr(
+        base_loader_module,
+        "process_weights_after_loading",
+        record_post_load,
+    )
+
+    loader = CustomModelLoader(load_config)
+    loader.load_model(vllm_config, model_config)  # type: ignore[arg-type]
+
+    assert seen_config is vllm_config
+
+
+def test_base_loader_scopes_each_expert_cache_load(monkeypatch):
+    load_config = LoadConfig(load_format="custom_load_format")
+    vllm_config = SimpleNamespace(
+        device_config=SimpleNamespace(device="cpu"),
+        load_config=load_config,
+        offload_config=SimpleNamespace(expert_cache_enabled=True),
+    )
+    model_config = SimpleNamespace(dtype=torch.float32)
+    phases: list[tuple[str, object]] = []
+
+    def record_phase(phase: str) -> None:
+        phases.append((phase, get_streamed_expert_cache_load_token()))
+
+    def initialize_model(**kwargs):
+        del kwargs
+        record_phase("initialize")
+        return nn.Linear(1, 1)
+
+    def load_weights(model, model_config):
+        del model, model_config
+        record_phase("load")
+
+    def process_weights_after_loading(*args):
+        del args
+        record_phase("postprocess")
+
+    monkeypatch.setattr(base_loader_module, "initialize_model", initialize_model)
+    monkeypatch.setattr(
+        base_loader_module,
+        "current_platform",
+        SimpleNamespace(is_cuda_alike=lambda: False, is_xpu=lambda: False),
+    )
+    monkeypatch.setattr(
+        base_loader_module,
+        "process_weights_after_loading",
+        process_weights_after_loading,
+    )
+
+    loader = CustomModelLoader(load_config)
+    monkeypatch.setattr(loader, "load_weights", load_weights)
+    loader.load_model(vllm_config, model_config)  # type: ignore[arg-type]
+    loader.load_model(vllm_config, model_config)  # type: ignore[arg-type]
+
+    assert [phase for phase, _ in phases] == [
+        "initialize",
+        "load",
+        "postprocess",
+    ] * 2
+    first_load_tokens = {id(token) for _, token in phases[:3]}
+    second_load_tokens = {id(token) for _, token in phases[3:]}
+    assert len(first_load_tokens) == 1
+    assert len(second_load_tokens) == 1
+    assert first_load_tokens != second_load_tokens
+    with pytest.raises(RuntimeError, match="model-load context"):
+        get_streamed_expert_cache_load_token()
 
 
 def test_invalid_model_loader():

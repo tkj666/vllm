@@ -1,5 +1,7 @@
 #include <array>
 #include <cub/cub.cuh>
+#include <limits>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <torch/csrc/stable/macros.h>
@@ -18,6 +20,29 @@
 
 namespace vllm {
 namespace moe {
+
+constexpr int32_t kMaxWaveExpertAssignments = 256;
+
+struct WaveExpertAssignments {
+  int32_t expert_ids[kMaxWaveExpertAssignments];
+  int32_t slot_indices[kMaxWaveExpertAssignments];
+};
+
+__global__ void update_expert_map_kernel(int32_t* __restrict__ expert_map,
+                                         int32_t num_experts,
+                                         int32_t num_assignments,
+                                         WaveExpertAssignments assignments) {
+  for (int32_t expert_id = threadIdx.x; expert_id < num_experts;
+       expert_id += blockDim.x) {
+    expert_map[expert_id] = -1;
+  }
+  __syncthreads();
+  if (threadIdx.x < num_assignments) {
+    expert_map[assignments.expert_ids[threadIdx.x]] =
+        assignments.slot_indices[threadIdx.x];
+  }
+}
+
 namespace batched_moe_align_block_size {
 
 // Note num_threads needs to be 1024 for BlockScan Reduction in the kernel.
@@ -622,13 +647,58 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
 }  // namespace moe
 }  // namespace vllm
 
+void moe_update_expert_map(torch::stable::Tensor expert_map,
+                           const std::vector<int64_t>& expert_ids,
+                           const std::vector<int64_t>& slot_indices) {
+  STD_TORCH_CHECK(expert_map.dim() == 1, "expert_map must be one-dimensional");
+  STD_TORCH_CHECK(
+      expert_map.scalar_type() == torch::headeronly::ScalarType::Int,
+      "expert_map must have int32 dtype");
+  STD_TORCH_CHECK(expert_map.is_contiguous(), "expert_map must be contiguous");
+  STD_TORCH_CHECK(expert_map.numel() <= std::numeric_limits<int32_t>::max(),
+                  "expert_map is too large");
+  STD_TORCH_CHECK(expert_ids.size() == slot_indices.size(),
+                  "expert_ids and slot_indices must have the same length");
+  STD_TORCH_CHECK(expert_ids.size() <= vllm::moe::kMaxWaveExpertAssignments,
+                  "a streamed expert wave supports at most ",
+                  vllm::moe::kMaxWaveExpertAssignments, " experts");
+
+  vllm::moe::WaveExpertAssignments assignments{};
+  for (size_t index = 0; index < expert_ids.size(); ++index) {
+    const int64_t expert_id = expert_ids[index];
+    const int64_t slot_index = slot_indices[index];
+    STD_TORCH_CHECK(expert_id >= 0 && expert_id < expert_map.numel(),
+                    "expert_id is outside expert_map");
+    STD_TORCH_CHECK(
+        slot_index >= 0 && slot_index <= std::numeric_limits<int32_t>::max(),
+        "slot_index must fit in a non-negative int32");
+    for (size_t previous = 0; previous < index; ++previous) {
+      STD_TORCH_CHECK(expert_ids[previous] != expert_id,
+                      "expert_ids must be unique");
+    }
+    assignments.expert_ids[index] = static_cast<int32_t>(expert_id);
+    assignments.slot_indices[index] = static_cast<int32_t>(slot_index);
+  }
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      expert_map.get_device_index());
+  const cudaStream_t stream =
+      get_current_cuda_stream(expert_map.get_device_index());
+  vllm::moe::update_expert_map_kernel<<<1, 256, 0, stream>>>(
+      reinterpret_cast<int32_t*>(expert_map.mutable_data_ptr()),
+      static_cast<int32_t>(expert_map.numel()),
+      static_cast<int32_t>(expert_ids.size()), assignments);
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // taken from
 // https://github.com/sgl-project/sglang/blob/8b5f83ed3b7d2a49ad5c5cd5aa61c5d502f47dbc
 void moe_align_block_size(
     torch::stable::Tensor topk_ids, int64_t num_experts, int64_t block_size,
     torch::stable::Tensor sorted_token_ids, torch::stable::Tensor experts_ids,
     torch::stable::Tensor num_tokens_post_pad,
-    std::optional<torch::stable::Tensor> maybe_expert_map) {
+    std::optional<torch::stable::Tensor> maybe_expert_map,
+    std::optional<torch::stable::Tensor> maybe_cumsum_buffer) {
   const torch::stable::accelerator::DeviceGuard device_guard(
       topk_ids.get_device_index());
   const cudaStream_t stream =
@@ -681,8 +751,24 @@ void moe_align_block_size(
               num_experts, block_size, topk_ids.numel(),
               sorted_token_ids.size(0), topk_ids.size(1), has_expert_map);
         } else {
-          torch::stable::Tensor cumsum_buffer = torch::stable::new_empty(
-              topk_ids, {num_experts + 1}, torch::headeronly::ScalarType::Int);
+          torch::stable::Tensor cumsum_buffer;
+          if (maybe_cumsum_buffer.has_value()) {
+            cumsum_buffer = maybe_cumsum_buffer.value();
+            STD_TORCH_CHECK(cumsum_buffer.scalar_type() ==
+                                torch::headeronly::ScalarType::Int,
+                            "cumsum_buffer must have int32 dtype");
+            STD_TORCH_CHECK(cumsum_buffer.is_contiguous(),
+                            "cumsum_buffer must be contiguous");
+            STD_TORCH_CHECK(cumsum_buffer.numel() >= num_experts + 1,
+                            "cumsum_buffer is too small");
+            STD_TORCH_CHECK(
+                cumsum_buffer.get_device_index() == topk_ids.get_device_index(),
+                "cumsum_buffer must be on the same device as topk_ids");
+          } else {
+            cumsum_buffer =
+                torch::stable::new_empty(topk_ids, {num_experts + 1},
+                                         torch::headeronly::ScalarType::Int);
+          }
           auto align_kernel = vllm::moe::moe_align_block_size_kernel<scalar_t>;
 
           size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);

@@ -1110,6 +1110,185 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("trace replay requires Model Runner V2")
 
+    def _verify_expert_cache_config(self) -> None:
+        """Validate the V1 streamed expert-cache compatibility contract."""
+        expert_cache = self.offload_config
+        if not expert_cache.expert_cache_enabled:
+            return
+
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda():
+            raise ValueError("Streamed expert caching is only supported on CUDA.")
+
+        model_config = self.model_config
+        if model_config is None:
+            raise ValueError("Streamed expert caching requires a model configuration.")
+
+        supported_architectures = {
+            "Qwen3MoeForCausalLM",
+            "Qwen3NextForCausalLM",
+        }
+        if model_config.architecture not in supported_architectures:
+            raise ValueError(
+                "Streamed expert caching only supports "
+                f"{sorted(supported_architectures)}, but got "
+                f"{model_config.architecture!r}."
+            )
+        hf_config = model_config.hf_text_config
+        mlp_only_layers = set(getattr(hf_config, "mlp_only_layers", None) or ())
+        sparse_step = getattr(hf_config, "decoder_sparse_step", 1)
+        num_routed_moe_layers = sum(
+            layer_id not in mlp_only_layers
+            and hf_config.num_experts > 0
+            and (layer_id + 1) % sparse_step == 0
+            for layer_id in range(hf_config.num_hidden_layers)
+        )
+        if not num_routed_moe_layers:
+            raise ValueError(
+                "Streamed expert caching requires at least one routed MoE layer."
+            )
+        arena_size = (
+            num_routed_moe_layers * expert_cache.expert_cache_per_layer_size
+            + expert_cache.expert_cache_shared_size
+        )
+        alignment_namespace = max(hf_config.num_experts, arena_size)
+        padded_alignment_namespace = ((alignment_namespace + 31) // 32) * 32
+        if padded_alignment_namespace >= 1024:
+            raise ValueError(
+                "Streamed expert caching supports at most 992 logical experts "
+                "or arena slots in the Triton alignment namespace, but got "
+                f"{alignment_namespace}."
+            )
+        if model_config.dtype != torch.bfloat16:
+            raise ValueError(
+                "Streamed expert caching requires bfloat16 model weights, "
+                f"but got {model_config.dtype}."
+            )
+        if self.quant_config is not None:
+            raise ValueError("Streamed expert caching does not support quantization.")
+        if self.lora_config is not None:
+            raise ValueError("Streamed expert caching does not support LoRA.")
+
+        supported_load_formats = {
+            "auto",
+            "dummy",
+            "fastsafetensors",
+            "hf",
+            "instanttensor",
+            "mistral",
+            "npcache",
+            "pt",
+            "runai_streamer",
+            "runai_streamer_sharded",
+            "safetensors",
+            "sharded_state",
+        }
+        load_format = self.load_config.load_format
+        if load_format not in supported_load_formats:
+            raise ValueError(
+                "Streamed expert caching does not support model loader format "
+                f"{load_format!r}. Supported formats: "
+                f"{sorted(supported_load_formats)}."
+            )
+        load_device = self.load_config.device
+        if load_device is not None and torch.device(load_device).type != "cuda":
+            raise ValueError(
+                "Streamed expert caching requires a CUDA model load device, "
+                f"but got {load_device!r}."
+            )
+
+        parallel_config = self.parallel_config
+        parallel_sizes = {
+            "tensor_parallel_size": parallel_config.tensor_parallel_size,
+            "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
+            "data_parallel_size": parallel_config.data_parallel_size,
+            "decode_context_parallel_size": (
+                parallel_config.decode_context_parallel_size
+            ),
+            "prefill_context_parallel_size": (
+                parallel_config.prefill_context_parallel_size
+            ),
+        }
+        unsupported_sizes = {
+            name: size for name, size in parallel_sizes.items() if size != 1
+        }
+        if unsupported_sizes:
+            details = ", ".join(
+                f"{name}={size}" for name, size in unsupported_sizes.items()
+            )
+            raise ValueError(
+                "Streamed expert caching requires TP1/PP1/DP1/DCP1/PCP1; "
+                f"got {details}."
+            )
+
+        enabled_ep_options = [
+            name
+            for name in (
+                "enable_expert_parallel",
+                "enable_eplb",
+                "enable_elastic_ep",
+                "enable_ep_weight_filter",
+            )
+            if getattr(parallel_config, name)
+        ]
+        if enabled_ep_options:
+            raise ValueError(
+                "Streamed expert caching does not support expert parallelism "
+                f"or EPLB; enabled: {', '.join(enabled_ep_options)}."
+            )
+
+        if self.compilation_config.pass_config.enable_sp:
+            raise ValueError(
+                "Streamed expert caching does not support sequence parallelism."
+            )
+        if parallel_config.enable_dbo:
+            raise ValueError("Streamed expert caching does not support DBO.")
+        if parallel_config.ubatch_size > 1:
+            raise ValueError("Streamed expert caching does not support microbatching.")
+        if self.max_concurrent_batches > 1:
+            raise ValueError(
+                "Streamed expert caching does not support concurrent model batches; "
+                "disable async scheduling."
+            )
+
+        if (
+            expert_cache.offload_backend != "auto"
+            or expert_cache.uva.cpu_offload_gb > 0
+            or expert_cache.prefetch.offload_group_size > 0
+        ):
+            raise ValueError(
+                "Streamed expert caching cannot be combined with model weight "
+                "offloading."
+            )
+        if self.weight_transfer_config is not None:
+            raise ValueError(
+                "Streamed expert caching does not support hot weight updates."
+            )
+        if model_config.enable_sleep_mode:
+            raise ValueError(
+                "Streamed expert caching does not support model sleep mode."
+            )
+        if self.kernel_config.moe_backend not in ("auto", "triton"):
+            raise ValueError(
+                "Streamed expert caching requires the Triton MoE backend, but got "
+                f"{self.kernel_config.moe_backend!r}."
+            )
+
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        if cudagraph_mode.has_full_cudagraphs():
+            raise ValueError(
+                "Streamed expert caching does not support full CUDA graphs; use "
+                "cudagraph_mode=PIECEWISE or NONE."
+            )
+        if cudagraph_mode.has_piecewise_cudagraphs():
+            splitting_ops = self.compilation_config.splitting_ops
+            if splitting_ops is None:
+                splitting_ops = self.compilation_config.splitting_ops = []
+            for op in ("vllm::moe_forward", "vllm::moe_forward_shared"):
+                if op not in splitting_ops:
+                    splitting_ops.append(op)
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1275,7 +1454,12 @@ class VllmConfig:
                 )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
-            if (
+            if self.offload_config.expert_cache_enabled:
+                logger.info_once(
+                    "Disabling asynchronous scheduling for streamed expert caching."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
                 self.model_config is not None
                 and self.model_config.runner_type == "pooling"
             ):
@@ -1497,6 +1681,10 @@ class VllmConfig:
         pass_config = self.compilation_config.pass_config
         if pass_config.fuse_gemm_comms:
             pass_config.enable_sp = True
+        if self.offload_config.expert_cache_enabled and pass_config.enable_sp:
+            raise ValueError(
+                "Streamed expert caching does not support sequence parallelism."
+            )
         if pass_config.enable_sp:
             if self.parallel_config.tensor_parallel_size == 1:
                 logger.warning_once("Sequence Parallelism requires TP>1, disabling")
@@ -1745,6 +1933,8 @@ class VllmConfig:
             logger.warning_once(
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
+
+        self._verify_expert_cache_config()
 
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend

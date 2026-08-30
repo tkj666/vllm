@@ -3,7 +3,7 @@
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import cloudpickle
 import torch.nn as nn
@@ -137,6 +137,12 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             these segments will be offloaded (e.g., {"gate_up_proj", "down_proj"}
             for MLP weights, or {"w13_weight", "w2_weight"} for MoE expert
             weights). If None or empty, all parameters are offloaded.
+        expert_cache_per_layer_size: Number of GPU expert-cache slots reserved
+            for each MoE layer. A positive value enables streamed expert caching.
+        expert_cache_shared_size: Number of GPU expert-cache slots shared across
+            compatible MoE layers.
+        expert_cache_policy: Expert-cache placement and eviction policy.
+        expert_cache_prefetch_policy: Expert-cache speculative prefetch policy.
         enforce_eager: Whether to enforce eager execution. If True, we will
             disable CUDA graph and always execute the model in eager mode.
             If False, we will use CUDA graph and eager execution in hybrid.
@@ -201,6 +207,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         offload_num_in_group: int = 1,
         offload_prefetch_step: int = 1,
         offload_params: set[str] | None = None,
+        expert_cache_per_layer_size: int = 0,
+        expert_cache_shared_size: int = 0,
+        expert_cache_policy: Literal["fifo"] = "fifo",
+        expert_cache_prefetch_policy: Literal["none", "dummy"] = "none",
         enforce_eager: bool = False,
         enable_return_routed_experts: bool = False,
         return_sampling_mask: bool = False,
@@ -318,6 +328,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             offload_num_in_group=offload_num_in_group,
             offload_prefetch_step=offload_prefetch_step,
             offload_params=offload_params or set(),
+            expert_cache_per_layer_size=expert_cache_per_layer_size,
+            expert_cache_shared_size=expert_cache_shared_size,
+            expert_cache_policy=expert_cache_policy,
+            expert_cache_prefetch_policy=expert_cache_prefetch_policy,
             enforce_eager=enforce_eager,
             enable_return_routed_experts=enable_return_routed_experts,
             return_sampling_mask=return_sampling_mask,

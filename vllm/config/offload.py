@@ -94,9 +94,34 @@ class OffloadConfig:
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
 
+    expert_cache_per_layer_size: int = Field(default=0, ge=0)
+    """Number of GPU expert-cache slots reserved for each MoE layer."""
+
+    expert_cache_shared_size: int = Field(default=0, ge=0)
+    """Number of GPU expert-cache slots shared across compatible MoE layers."""
+
+    expert_cache_policy: Literal["fifo"] = "fifo"
+    """Expert-cache placement and eviction policy."""
+
+    expert_cache_prefetch_policy: Literal["none", "dummy"] = "none"
+    """Expert-cache speculative prefetch policy."""
+
+    @property
+    def expert_cache_enabled(self) -> bool:
+        """Whether streamed expert caching is enabled."""
+        return self.expert_cache_per_layer_size > 0 or self.expert_cache_shared_size > 0
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
+        if self.expert_cache_prefetch_policy == "dummy" and not (
+            self.expert_cache_enabled
+        ):
+            raise ValueError(
+                "expert_cache_prefetch_policy='dummy' requires streamed "
+                "expert caching to be enabled"
+            )
+
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(

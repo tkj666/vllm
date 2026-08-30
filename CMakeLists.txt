@@ -322,6 +322,21 @@ endif()
 #
 
 #
+# Native CUDA copy scheduler extension
+#
+
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  define_extension_target(
+    cuda_copy_scheduler_C
+    DESTINATION vllm
+    LANGUAGE CXX
+    SOURCES "csrc/cuda_copy_scheduler.cpp"
+    LIBRARIES CUDA::cudart CUDA::nvToolsExt
+    USE_SABI 3.11
+    WITH_SOABI)
+endif()
+
+#
 # cumem_allocator extension
 #
 

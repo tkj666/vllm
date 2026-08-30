@@ -5646,6 +5646,11 @@ class GPUModelRunner(
             is_checkpoint_format: set to False if weights have already been
                 processed into kernel format (repacking, renaming, etc.)
         """
+        if self.offload_config.expert_cache_enabled:
+            raise RuntimeError(
+                "streamed expert caching does not support hot weight updates"
+            )
+
         # TODO(@kylesayrs): generalize to all runners and loaders
         # argument validation
         if weights_iterator is None and not is_checkpoint_format:

@@ -88,6 +88,20 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
+        cached_layer = getattr(layer, "cached_expert_layer", None)
+        if cached_layer is not None:
+            prepared = cached_layer.prepare(
+                self.moe_kernel,
+                x,
+                topk_weights,
+                topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
+            return cached_layer.execute(prepared)
         return self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,

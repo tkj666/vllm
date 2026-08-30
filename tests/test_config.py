@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pydantic
 import pytest
+import torch
 from huggingface_hub import ResolvedRevision
 from pydantic import ValidationError
 
@@ -21,6 +22,7 @@ from vllm.config import (
     KernelConfig,
     ModelConfig,
     ObservabilityConfig,
+    OffloadConfig,
     ParallelConfig,
     PoolerConfig,
     SchedulerConfig,
@@ -39,6 +41,217 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def _make_expert_cache_vllm_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        offload_config=OffloadConfig(expert_cache_per_layer_size=1),
+        model_config=SimpleNamespace(
+            architecture="Qwen3MoeForCausalLM",
+            dtype=torch.bfloat16,
+            enable_sleep_mode=False,
+            hf_text_config=SimpleNamespace(
+                num_hidden_layers=2,
+                num_experts=4,
+                mlp_only_layers=None,
+                decoder_sparse_step=1,
+            ),
+        ),
+        quant_config=None,
+        lora_config=None,
+        load_config=LoadConfig(),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            enable_expert_parallel=False,
+            enable_eplb=False,
+            enable_elastic_ep=False,
+            enable_ep_weight_filter=False,
+            enable_dbo=False,
+            ubatch_size=0,
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            splitting_ops=["vllm::unified_attention_with_output"],
+        ),
+        kernel_config=SimpleNamespace(moe_backend="auto"),
+        weight_transfer_config=None,
+        max_concurrent_batches=1,
+    )
+
+
+def _set_nested_attr(obj: object, path: str, value: object) -> None:
+    parts = path.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    setattr(obj, parts[-1], value)
+
+
+def test_expert_cache_capacity_config_and_hash():
+    disabled = OffloadConfig()
+    enabled = OffloadConfig(
+        expert_cache_per_layer_size=2,
+        expert_cache_shared_size=3,
+    )
+    dummy_prefetch = OffloadConfig(
+        expert_cache_per_layer_size=2,
+        expert_cache_shared_size=3,
+        expert_cache_prefetch_policy="dummy",
+    )
+    shared_only = OffloadConfig(
+        expert_cache_shared_size=3,
+        expert_cache_prefetch_policy="dummy",
+    )
+
+    assert not disabled.expert_cache_enabled
+    assert disabled.expert_cache_prefetch_policy == "none"
+    assert enabled.expert_cache_enabled
+    assert shared_only.expert_cache_enabled
+    assert shared_only.expert_cache_per_layer_size == 0
+    assert enabled.expert_cache_policy == "fifo"
+    assert disabled.compute_hash() != enabled.compute_hash()
+    assert enabled.compute_hash() != dummy_prefetch.compute_hash()
+
+    with pytest.raises(ValidationError, match="fifo"):
+        OffloadConfig(
+            expert_cache_per_layer_size=1,
+            expert_cache_policy="lru",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError, match="requires streamed expert caching"):
+        OffloadConfig(expert_cache_prefetch_policy="dummy")
+    with pytest.raises(ValidationError, match="none.*dummy"):
+        OffloadConfig(
+            expert_cache_per_layer_size=1,
+            expert_cache_prefetch_policy="oracle",  # type: ignore[arg-type]
+        )
+
+
+def test_expert_cache_disabled_skips_cross_config_validation():
+    config = SimpleNamespace(offload_config=OffloadConfig())
+    VllmConfig._verify_expert_cache_config(config)
+
+
+def test_expert_cache_accepts_shared_only_arena(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _make_expert_cache_vllm_config()
+    config.offload_config = OffloadConfig(
+        expert_cache_shared_size=16,
+        expert_cache_prefetch_policy="dummy",
+    )
+
+    VllmConfig._verify_expert_cache_config(config)
+
+
+def test_expert_cache_piecewise_config_adds_moe_split_ops(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _make_expert_cache_vllm_config()
+
+    VllmConfig._verify_expert_cache_config(config)
+    VllmConfig._verify_expert_cache_config(config)
+
+    splitting_ops = config.compilation_config.splitting_ops
+    assert splitting_ops.count("vllm::moe_forward") == 1
+    assert splitting_ops.count("vllm::moe_forward_shared") == 1
+
+
+@pytest.mark.parametrize(
+    "load_format",
+    [
+        "auto",
+        "dummy",
+        "fastsafetensors",
+        "hf",
+        "instanttensor",
+        "mistral",
+        "npcache",
+        "pt",
+        "runai_streamer",
+        "runai_streamer_sharded",
+        "safetensors",
+        "sharded_state",
+    ],
+)
+def test_expert_cache_accepts_base_loader_formats(monkeypatch, load_format):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _make_expert_cache_vllm_config()
+    config.load_config.load_format = load_format
+
+    VllmConfig._verify_expert_cache_config(config)
+
+
+@pytest.mark.parametrize("load_format", ["tensorizer", "modelexpress", "plugin"])
+def test_expert_cache_rejects_unsupported_loader_formats(monkeypatch, load_format):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _make_expert_cache_vllm_config()
+    config.load_config.load_format = load_format
+
+    with pytest.raises(ValueError, match="model loader format"):
+        VllmConfig._verify_expert_cache_config(config)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        ("model_config.architecture", "LlamaForCausalLM", "only supports"),
+        (
+            "model_config.hf_text_config.num_experts",
+            0,
+            "at least one routed MoE layer",
+        ),
+        (
+            "model_config.hf_text_config.mlp_only_layers",
+            [0, 1],
+            "at least one routed MoE layer",
+        ),
+        (
+            "model_config.hf_text_config.num_experts",
+            993,
+            "at most 992",
+        ),
+        (
+            "offload_config.expert_cache_per_layer_size",
+            497,
+            "at most 992",
+        ),
+        ("model_config.dtype", torch.float16, "bfloat16"),
+        ("quant_config", object(), "quantization"),
+        ("lora_config", object(), "LoRA"),
+        ("load_config.device", "cpu", "CUDA model load device"),
+        ("parallel_config.tensor_parallel_size", 2, "TP1"),
+        ("parallel_config.data_parallel_size", 2, "DP1"),
+        ("parallel_config.enable_expert_parallel", True, "expert parallelism"),
+        ("parallel_config.enable_eplb", True, "EPLB"),
+        ("compilation_config.pass_config.enable_sp", True, "sequence parallelism"),
+        ("parallel_config.enable_dbo", True, "DBO"),
+        ("parallel_config.ubatch_size", 2, "microbatching"),
+        ("max_concurrent_batches", 2, "concurrent model batches"),
+        ("offload_config.offload_backend", "prefetch", "weight offloading"),
+        ("offload_config.uva.cpu_offload_gb", 1, "weight offloading"),
+        ("offload_config.prefetch.offload_group_size", 1, "weight offloading"),
+        ("weight_transfer_config", object(), "hot weight updates"),
+        ("model_config.enable_sleep_mode", True, "sleep mode"),
+        ("kernel_config.moe_backend", "cutlass", "Triton MoE backend"),
+        ("compilation_config.cudagraph_mode", CUDAGraphMode.FULL, "full CUDA"),
+    ],
+)
+def test_expert_cache_rejects_unsupported_config(monkeypatch, path, value, match):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _make_expert_cache_vllm_config()
+    _set_nested_attr(config, path, value)
+
+    with pytest.raises(ValueError, match=match):
+        VllmConfig._verify_expert_cache_config(config)
+
+
+def test_expert_cache_rejects_non_cuda(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    config = _make_expert_cache_vllm_config()
+
+    with pytest.raises(ValueError, match="only supported on CUDA"):
+        VllmConfig._verify_expert_cache_config(config)
 
 
 def test_kda_recoverssm_derivation_is_revalidated():

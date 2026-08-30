@@ -538,6 +538,12 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    expert_cache_per_layer_size: int = OffloadConfig.expert_cache_per_layer_size
+    expert_cache_shared_size: int = OffloadConfig.expert_cache_shared_size
+    expert_cache_policy: Literal["fifo"] = OffloadConfig.expert_cache_policy
+    expert_cache_prefetch_policy: Literal["none", "dummy"] = (
+        OffloadConfig.expert_cache_prefetch_policy
+    )
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1311,6 +1317,22 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
+        )
+        offload_group.add_argument(
+            "--expert-cache-per-layer-size",
+            **offload_kwargs["expert_cache_per_layer_size"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-shared-size",
+            **offload_kwargs["expert_cache_shared_size"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-policy",
+            **offload_kwargs["expert_cache_policy"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-prefetch-policy",
+            **offload_kwargs["expert_cache_prefetch_policy"],
         )
 
         # Multimodal related configs
@@ -2516,6 +2538,10 @@ class EngineArgs:
 
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,
+            expert_cache_per_layer_size=self.expert_cache_per_layer_size,
+            expert_cache_shared_size=self.expert_cache_shared_size,
+            expert_cache_policy=self.expert_cache_policy,
+            expert_cache_prefetch_policy=self.expert_cache_prefetch_policy,
             uva=UVAOffloadConfig(
                 cpu_offload_gb=self.cpu_offload_gb,
                 cpu_offload_params=self.cpu_offload_params,

@@ -235,7 +235,101 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
-    ):
+    ) -> None:
+        self._apply_impl(
+            output=output,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            a1q_scale=a1q_scale,
+            a2_scale=a2_scale,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_tokens_meta=expert_tokens_meta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            route_output=None,
+            ignore_invalid_experts=False,
+            alignment_outputs=None,
+        )
+
+    def apply_streamed_wave(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        route_output: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+        alignment_outputs: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ) -> None:
+        """Execute one expert-map wave without reducing its route outputs."""
+        self._apply_impl(
+            output=output,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            a1q_scale=a1q_scale,
+            a2_scale=a2_scale,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_tokens_meta=expert_tokens_meta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            route_output=route_output,
+            ignore_invalid_experts=True,
+            alignment_outputs=alignment_outputs,
+        )
+
+    def finalize_streamed(
+        self, route_output: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        """Reduce routes once after every streamed wave has completed."""
+        self.moe_sum(route_output, output)
+
+    def _apply_impl(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+        route_output: torch.Tensor | None,
+        ignore_invalid_experts: bool,
+        alignment_outputs: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ),
+    ) -> None:
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"
@@ -283,9 +377,14 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = E
 
+        config_w1_size = w1.size()
+        config_w2_size = w2.size()
+        if route_output is not None:
+            config_w1_size = torch.Size((global_num_experts, *w1.shape[1:]))
+            config_w2_size = torch.Size((global_num_experts, *w2.shape[1:]))
         config = try_get_optimal_moe_config(
-            w1.size(),
-            w2.size(),
+            config_w1_size,
+            config_w2_size,
             top_k_num,
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
@@ -313,10 +412,26 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         intermediate_cache2 = _resize_cache(
             workspace13, (num_tokens * top_k_num, cache2_dim)
         )
-        intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+        route_shape = (num_tokens, top_k_num, K)
+        if route_output is None:
+            intermediate_cache3 = _resize_cache(workspace2, route_shape)
+        else:
+            if (
+                route_output.shape != route_shape
+                or route_output.dtype != output.dtype
+                or route_output.device != output.device
+                or not route_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "route_output must be a contiguous tensor with shape "
+                    f"{route_shape}, dtype {output.dtype}, and device {output.device}"
+                )
+            intermediate_cache3 = route_output
 
         # Include fused shared-expert rows while preserving EP remapping.
         num_align_experts = w1.shape[0] if expert_map is None else global_num_experts
+        if ignore_invalid_experts:
+            num_align_experts = max(num_align_experts, w1.shape[0])
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             _prepare_expert_assignment(
                 topk_ids,
@@ -328,6 +443,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 use_int8_w8a16=self.quant_config.use_int8_w8a16,
                 use_int4_w4a16=self.quant_config.use_int4_w4a16,
                 block_shape=self.block_shape,
+                ignore_invalid_experts=ignore_invalid_experts,
+                alignment_outputs=alignment_outputs,
             )
         )
 
@@ -559,8 +676,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                     top_k_num=top_k_num,
                 )
 
-        # separate function is required for MoE + LoRA
-        self.moe_sum(intermediate_cache3, output)
+        if route_output is None:
+            self.moe_sum(intermediate_cache3, output)
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         ops.moe_sum(input, output)

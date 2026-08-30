@@ -15,6 +15,10 @@ def moe_align_block_size(
     expert_map: torch.Tensor | None = None,
     pad_sorted_ids: bool = False,
     ignore_invalid_experts: bool = False,
+    sorted_ids_out: torch.Tensor | None = None,
+    expert_ids_out: torch.Tensor | None = None,
+    num_tokens_post_pad_out: torch.Tensor | None = None,
+    cumsum_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -78,14 +82,35 @@ def moe_align_block_size(
         max_num_tokens_padded = min(
             topk_ids.numel() * block_size, max_num_tokens_padded
         )
-    sorted_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    sorted_ids = _alignment_output(
+        sorted_ids_out,
+        size=max_num_tokens_padded,
+        device=topk_ids.device,
+        name="sorted_ids_out",
     )
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    expert_ids = _alignment_output(
+        expert_ids_out,
+        size=max_num_m_blocks,
+        device=topk_ids.device,
+        name="expert_ids_out",
     )
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+    num_tokens_post_pad = _alignment_output(
+        num_tokens_post_pad_out,
+        size=1,
+        device=topk_ids.device,
+        name="num_tokens_post_pad_out",
+    )
+    cumsum_buffer = (
+        None
+        if cumsum_out is None
+        else _alignment_output(
+            cumsum_out,
+            size=num_experts + 1,
+            device=topk_ids.device,
+            name="cumsum_out",
+        )
+    )
 
     ops.moe_align_block_size(
         topk_ids,
@@ -95,12 +120,29 @@ def moe_align_block_size(
         expert_ids,
         num_tokens_post_pad,
         expert_map if ignore_invalid_experts else None,
+        cumsum_buffer,
     )
 
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]
 
     return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def _alignment_output(
+    output: torch.Tensor | None,
+    *,
+    size: int,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if output is None:
+        return torch.empty((size,), dtype=torch.int32, device=device)
+    if output.dtype != torch.int32 or output.device != device:
+        raise ValueError(f"{name} must be an int32 tensor on {device}")
+    if not output.is_contiguous() or output.numel() < size:
+        raise ValueError(f"{name} must be contiguous with at least {size} elements")
+    return output.view(-1)[:size]
 
 
 def batched_moe_align_block_size(

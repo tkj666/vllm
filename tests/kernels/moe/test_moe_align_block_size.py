@@ -8,6 +8,7 @@ Run `pytest tests/kernels/moe/test_moe_align_block_size.py`.
 import pytest
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
@@ -20,6 +21,25 @@ NUM_EXPERTS = [32, 160, 256, 257]
 TOP_KS = [1, 2, 16, 32]
 BLOCK_SIZES = [32, 128]
 set_random_seed(0)
+
+
+def test_moe_update_expert_map() -> None:
+    expert_map = torch.full((8,), 99, device="cuda", dtype=torch.int32)
+
+    ops.moe_update_expert_map(expert_map, [6, 1], [3, 0])
+
+    expected = torch.full_like(expert_map, -1)
+    expected[6] = 3
+    expected[1] = 0
+    torch.testing.assert_close(expert_map, expected, atol=0, rtol=0)
+
+    ops.moe_update_expert_map(expert_map, [], [])
+    torch.testing.assert_close(
+        expert_map,
+        torch.full_like(expert_map, -1),
+        atol=0,
+        rtol=0,
+    )
 
 
 def _group_tokens_by_expert(
@@ -325,6 +345,159 @@ def test_moe_align_block_size_deterministic():
         assert torch.equal(results[0][2], results[i][2]), (
             "num_tokens should be deterministic"
         )
+
+
+def test_moe_align_block_size_reuses_caller_outputs():
+    m, topk, num_experts, block_size = 8, 2, 8, 16
+    topk_ids = torch.randint(
+        0, num_experts, (m, topk), device="cuda", dtype=torch.int32
+    )
+    expected = moe_align_block_size(topk_ids, block_size, num_experts)
+
+    sorted_ids_out = torch.empty(
+        expected[0].numel() + 17, device="cuda", dtype=torch.int32
+    )
+    expert_ids_out = torch.empty(
+        expected[1].numel() + 3, device="cuda", dtype=torch.int32
+    )
+    num_tokens_out = torch.empty(4, device="cuda", dtype=torch.int32)
+    cumsum_out = torch.empty(num_experts + 1, device="cuda", dtype=torch.int32)
+    output_ptrs = tuple(
+        output.data_ptr() for output in (sorted_ids_out, expert_ids_out, num_tokens_out)
+    )
+
+    for _ in range(2):
+        actual = moe_align_block_size(
+            topk_ids,
+            block_size,
+            num_experts,
+            sorted_ids_out=sorted_ids_out,
+            expert_ids_out=expert_ids_out,
+            num_tokens_post_pad_out=num_tokens_out,
+            cumsum_out=cumsum_out,
+        )
+
+        assert tuple(output.data_ptr() for output in actual) == output_ptrs
+        assert tuple(output.shape for output in actual) == tuple(
+            output.shape for output in expected
+        )
+        for actual_output, expected_output in zip(actual, expected):
+            torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("output_name", "output", "error"),
+    [
+        (
+            "sorted_ids_out",
+            lambda size: torch.empty(size, device="cuda", dtype=torch.float32),
+            "sorted_ids_out must be an int32 tensor on cuda",
+        ),
+        (
+            "expert_ids_out",
+            lambda size: torch.empty(size, device="cpu", dtype=torch.int32),
+            "expert_ids_out must be an int32 tensor on cuda",
+        ),
+        (
+            "num_tokens_post_pad_out",
+            lambda size: torch.empty(
+                (max(size, 2), 2), device="cuda", dtype=torch.int32
+            )[:, 0],
+            "num_tokens_post_pad_out must be contiguous",
+        ),
+        (
+            "sorted_ids_out",
+            lambda size: torch.empty(size - 1, device="cuda", dtype=torch.int32),
+            "sorted_ids_out must be contiguous with at least",
+        ),
+        (
+            "cumsum_out",
+            lambda size: torch.empty(size - 1, device="cuda", dtype=torch.int32),
+            "cumsum_out must be contiguous with at least",
+        ),
+    ],
+)
+def test_moe_align_block_size_validates_caller_outputs(
+    output_name: str,
+    output,
+    error: str,
+):
+    m, topk, num_experts, block_size = 8, 2, 8, 16
+    topk_ids = torch.randint(
+        0, num_experts, (m, topk), device="cuda", dtype=torch.int32
+    )
+    expected = moe_align_block_size(topk_ids, block_size, num_experts)
+    output_sizes = {
+        "sorted_ids_out": expected[0].numel(),
+        "expert_ids_out": expected[1].numel(),
+        "num_tokens_post_pad_out": expected[2].numel(),
+        "cumsum_out": num_experts + 1,
+    }
+
+    with pytest.raises(ValueError, match=error):
+        moe_align_block_size(
+            topk_ids,
+            block_size,
+            num_experts,
+            **{output_name: output(output_sizes[output_name])},
+        )
+
+
+def test_moe_align_block_size_replays_graph_without_allocating_workspace():
+    m, topk, num_experts, block_size = 1, 8, 128, 64
+    topk_ids = torch.randint(
+        0, num_experts, (m, topk), device="cuda", dtype=torch.int32
+    )
+    expert_map = torch.arange(num_experts, device="cuda", dtype=torch.int32)
+    expected = moe_align_block_size(
+        topk_ids,
+        block_size,
+        num_experts,
+        expert_map=expert_map,
+        ignore_invalid_experts=True,
+    )
+    sorted_ids_out = torch.empty_like(expected[0])
+    expert_ids_out = torch.empty_like(expected[1])
+    num_tokens_out = torch.empty_like(expected[2])
+    cumsum_out = torch.empty(num_experts + 1, device="cuda", dtype=torch.int32)
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        moe_align_block_size(
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map=expert_map,
+            ignore_invalid_experts=True,
+            sorted_ids_out=sorted_ids_out,
+            expert_ids_out=expert_ids_out,
+            num_tokens_post_pad_out=num_tokens_out,
+            cumsum_out=cumsum_out,
+        )
+        torch.cuda.synchronize()
+    profiler_keys = {event.key for event in profile.key_averages()}
+    assert "aten::new_empty" not in profiler_keys
+    assert "aten::empty" not in profiler_keys
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = moe_align_block_size(
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map=expert_map,
+            ignore_invalid_experts=True,
+            sorted_ids_out=sorted_ids_out,
+            expert_ids_out=expert_ids_out,
+            num_tokens_post_pad_out=num_tokens_out,
+            cumsum_out=cumsum_out,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for actual_output, expected_output in zip(actual, expected):
+        torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("max_tokens_per_batch", [13, 16, 512])
