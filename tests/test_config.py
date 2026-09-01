@@ -182,6 +182,21 @@ def test_expert_cache_accepts_shared_only_arena(monkeypatch):
     VllmConfig._verify_expert_cache_config(config)
 
 
+def test_expert_cache_accepts_qwen3_5_moe(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _make_expert_cache_vllm_config()
+    config.model_config.architecture = "Qwen3_5MoeForConditionalGeneration"
+    config.model_config.hf_text_config = SimpleNamespace(
+        num_hidden_layers=40,
+        num_experts=256,
+        mlp_only_layers=[],
+        decoder_sparse_step=1,
+    )
+    config.offload_config = OffloadConfig(expert_cache_shared_size=16)
+
+    VllmConfig._verify_expert_cache_config(config)
+
+
 def test_expert_cache_piecewise_config_adds_moe_split_ops(monkeypatch):
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     config = _make_expert_cache_vllm_config()
@@ -321,7 +336,6 @@ def test_expert_cache_requires_lazy_safetensors_for_deepseek_v4(
     [
         "auto",
         "dummy",
-        "fastsafetensors",
         "hf",
         "instanttensor",
         "mistral",
@@ -348,6 +362,15 @@ def test_expert_cache_rejects_unsupported_loader_formats(monkeypatch, load_forma
     config.load_config.load_format = load_format
 
     with pytest.raises(ValueError, match="model loader format"):
+        VllmConfig._verify_expert_cache_config(config)
+
+
+def test_expert_cache_rejects_fastsafetensors_gpu_staging(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _make_expert_cache_vllm_config()
+    config.load_config.load_format = "fastsafetensors"
+
+    with pytest.raises(ValueError, match="stages checkpoint shards on the GPU"):
         VllmConfig._verify_expert_cache_config(config)
 
 

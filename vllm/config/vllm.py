@@ -1127,6 +1127,7 @@ class VllmConfig:
 
         supported_architectures = {
             "DeepseekV4ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
             "Qwen3MoeForCausalLM",
             "Qwen3NextForCausalLM",
         }
@@ -1227,7 +1228,6 @@ class VllmConfig:
         supported_load_formats = {
             "auto",
             "dummy",
-            "fastsafetensors",
             "hf",
             "instanttensor",
             "mistral",
@@ -1239,6 +1239,13 @@ class VllmConfig:
             "sharded_state",
         }
         load_format = self.load_config.load_format
+        if load_format == "fastsafetensors":
+            raise ValueError(
+                "Streamed expert caching does not support load_format="
+                "'fastsafetensors' because it stages checkpoint shards on the "
+                "GPU. Use load_format='safetensors' with "
+                "safetensors_load_strategy='lazy'."
+            )
         if is_deepseek_v4 and (
             load_format != "safetensors"
             or self.load_config.safetensors_load_strategy != "lazy"
