@@ -6809,6 +6809,7 @@ class GPUModelRunner(
 
         # Use a temporary pool for profiling to avoid fragmentation in the main pool.
         profiling_pool = current_platform.graph_pool_handle()
+        isolated_profiling_pool = current_platform.graph_pool_handle()
         encoder_profiling_pool = current_platform.graph_pool_handle()
         original_pools: dict[int, Any] = {}
         all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
@@ -6816,7 +6817,14 @@ class GPUModelRunner(
         )
         for instance in all_wrappers:
             original_pools[id(instance)] = instance.graph_pool
-            instance.graph_pool = profiling_pool
+            isolate_pool = getattr(
+                getattr(instance, "cudagraph_options", None),
+                "isolate_graph_pool",
+                False,
+            )
+            instance.graph_pool = (
+                isolated_profiling_pool if isolate_pool else profiling_pool
+            )
 
         shared_memory_estimate = {}
         per_graph_estimate = {}

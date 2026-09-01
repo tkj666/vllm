@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -66,6 +67,23 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+def _select_prepare_and_attn_fn(
+    prepare_and_attn: Callable[..., None],
+    prepare_and_attn_eager: Callable[..., None],
+    *,
+    use_v2_model_runner: bool,
+) -> Callable[..., None]:
+    if current_platform.is_device_capability(89):
+        # SM89 support can enable breakable graphs after this module imports.
+        wrapped = eager_break_during_capture(prepare_and_attn)
+        if wrapped is not prepare_and_attn:
+            return wrapped
+    if not use_v2_model_runner:
+        # MRV1 requires the wide eager region to avoid corrupt graph output.
+        return prepare_and_attn_eager
+    return prepare_and_attn
 
 
 @triton.jit
@@ -295,12 +313,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 aux_stream=indexer_aux_stream,
             )
 
-        self._prepare_and_attn_fn = self._prepare_and_attn
-        if not vllm_config.use_v2_model_runner:
-            # MRV1's piecewise capture only tolerates the wide eager region: with
-            # the narrow one the attention input preparation stays in the captured
-            # graph and MRV1 produces garbage (#51430).
-            self._prepare_and_attn_fn = self._prepare_and_attn_eager
+        self._prepare_and_attn_fn = _select_prepare_and_attn_fn(
+            self._prepare_and_attn,
+            self._prepare_and_attn_eager,
+            use_v2_model_runner=vllm_config.use_v2_model_runner,
+        )
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
@@ -368,8 +385,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             device=hidden_states.device,
         )
 
-        # Keep the attention input preparation in the captured graph. Only the
-        # sparse indexer and MLA attention run in the eager break below.
+        # The selected callable controls whether preparation joins the eager
+        # attention region or remains in the captured graph.
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
             self._run_parallel_input_projections(hidden_states)
         )
@@ -436,10 +453,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         positions: torch.Tensor,
         o_padded: torch.Tensor,
     ) -> None:
-        """Attention input preparation followed by the sparse indexer and MLA.
-
-        Only the latter runs in the eager break.
-        """
+        """Run attention input preparation, sparse indexing, and MLA."""
         attn_metadata = get_forward_context().attn_metadata
         indexer = self.indexer
         compressor = self.compressor

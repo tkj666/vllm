@@ -439,6 +439,174 @@ def test_ordered_unique_bulk_converts_routing_ids(
     assert _ordered_unique(routing_ids) == (4, 2, 1, 3)
 
 
+@pytest.mark.parametrize(
+    ("use_direct_capture", "expected_calls"),
+    [(False, 2), (True, 1)],
+)
+def test_initial_replay_helper_does_not_double_replay_direct_capture(
+    use_direct_capture: bool,
+    expected_calls: int,
+) -> None:
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+        _invoke_cudagraph_with_initial_replay,
+    )
+
+    class FakeWrapper(CUDAGraphWrapper):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.concrete_cudagraph_entries: dict[object, object] = {}
+            self.cudagraph_options = SimpleNamespace(
+                use_direct_capture=use_direct_capture
+            )
+
+        def __call__(self, *args: torch.Tensor, **kwargs: object) -> int:
+            del args, kwargs
+            self.calls += 1
+            self.concrete_cudagraph_entries.setdefault(
+                "descriptor", SimpleNamespace(cudagraph=object())
+            )
+            return self.calls
+
+    wrapper = FakeWrapper()
+
+    output = _invoke_cudagraph_with_initial_replay(wrapper, torch.empty(0))
+
+    assert output == expected_calls
+    assert wrapper.calls == expected_calls
+
+
+def test_prepare_expert_demand_ignores_padding_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import cached_expert_layer
+    from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+        CachedExpertLayer,
+    )
+
+    claimed: list[tuple[int, ...]] = []
+
+    class Binding:
+        layer_id = 0
+
+        def claim_resident(
+            self,
+            expert_ids: tuple[int, ...],
+            *,
+            max_pending_claims: int,
+        ) -> tuple[tuple[()], tuple[int, ...], tuple[()]]:
+            assert max_pending_claims == 2
+            claimed.append(expert_ids)
+            return (), expert_ids, ()
+
+    layer = CachedExpertLayer.__new__(CachedExpertLayer)
+    layer.runtime = SimpleNamespace(cancel_dummy_prefetch_for=lambda layer_id: None)
+    layer.binding = Binding()
+    layer.num_experts = 256
+    routing_ready = _FakeEvent()
+    monkeypatch.setattr(
+        cached_expert_layer.torch.cuda.nvtx,
+        "range",
+        lambda message: nullcontext(),
+    )
+
+    demand = layer._prepare_expert_demand(
+        torch.tensor([[-1, 0, 255, -1]], dtype=torch.int32),
+        routing_ready,
+    )
+
+    assert routing_ready.synchronize_calls == 1
+    assert claimed == [(0, 255)]
+    assert demand.expert_ids == (0, 255)
+
+
+@pytest.mark.parametrize("invalid_expert_id", [-2, 256])
+def test_prepare_expert_demand_rejects_non_padding_invalid_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_expert_id: int,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import cached_expert_layer
+    from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+        CachedExpertLayer,
+    )
+
+    layer = CachedExpertLayer.__new__(CachedExpertLayer)
+    layer.runtime = SimpleNamespace(cancel_dummy_prefetch_for=lambda layer_id: None)
+    layer.binding = SimpleNamespace(layer_id=0)
+    layer.num_experts = 256
+    monkeypatch.setattr(
+        cached_expert_layer.torch.cuda.nvtx,
+        "range",
+        lambda message: nullcontext(),
+    )
+
+    with pytest.raises(ValueError, match="physical expert range"):
+        layer._prepare_expert_demand(
+            torch.tensor([[0, invalid_expert_id]], dtype=torch.int32),
+            _FakeEvent(),
+        )
+
+
+def test_begin_forward_same_stream_does_not_query_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import cached_expert_layer
+    from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+        _StreamedExpertCacheRuntime,
+    )
+
+    stream = object()
+    stream_id = (torch.device("cuda"), 17)
+    completion = _RaisingQueryEvent()
+    runtime = _StreamedExpertCacheRuntime.__new__(_StreamedExpertCacheRuntime)
+    runtime._stream_guard_failed = False
+    runtime._last_compute_done = completion
+    runtime._last_compute_stream_id = stream_id
+    monkeypatch.setattr(
+        cached_expert_layer,
+        "_stream_identity",
+        lambda selected_stream: stream_id,
+    )
+
+    runtime.begin_forward(stream)
+
+    assert completion.query_calls == 0
+    assert runtime._last_compute_done is completion
+    assert runtime._last_compute_stream_id == stream_id
+    assert not runtime._stream_guard_failed
+
+
+def test_begin_forward_capture_rejects_different_stream_without_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import cached_expert_layer
+    from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+        _StreamedExpertCacheRuntime,
+    )
+
+    completion = _RaisingQueryEvent()
+    runtime = _StreamedExpertCacheRuntime.__new__(_StreamedExpertCacheRuntime)
+    runtime._stream_guard_failed = False
+    runtime._last_compute_done = completion
+    runtime._last_compute_stream_id = (torch.device("cuda"), 17)
+    monkeypatch.setattr(
+        cached_expert_layer,
+        "_stream_identity",
+        lambda selected_stream: (torch.device("cuda"), 23),
+    )
+    monkeypatch.setattr(
+        cached_expert_layer.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+
+    with pytest.raises(RuntimeError, match="overlapping CUDA streams"):
+        runtime.begin_forward(object())
+
+    assert completion.query_calls == 0
+    assert not runtime._stream_guard_failed
+
+
 def test_shared_host_storage_keeps_layer_expert_bundles_distinct() -> None:
     storage = torch.UntypedStorage(256, device="cpu")
 
@@ -999,7 +1167,7 @@ def test_native_prefetch_reservation_rejects_nonprefix_snapshot() -> None:
     reservation.abort()
 
 
-def test_native_prefetch_register_precomputes_shared_only_copy_templates(
+def test_native_prefetch_register_includes_shared_slots_with_reserved_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm.model_executor.layers.fused_moe import cached_expert_layer
@@ -1020,7 +1188,7 @@ def test_native_prefetch_register_precomputes_shared_only_copy_templates(
             self.recorded_stream = stream
 
     class Binding:
-        reserved_slot_indices = ()
+        reserved_slot_indices = (2,)
         prefetch_slot_indices = (2, 4)
 
         def prefetch_copy_layouts(self):
@@ -1089,6 +1257,29 @@ def test_native_prefetch_register_precomputes_shared_only_copy_templates(
         prefetcher.close()
 
 
+def test_streamed_runtime_finalizer_waits_for_native_prefetch_shutdown() -> None:
+    from vllm.model_executor.layers.fused_moe.cached_expert_layer import (
+        _StreamedExpertCacheRuntime,
+    )
+
+    close_calls: list[bool] = []
+
+    class Prefetcher:
+        def close(self, *, wait: bool = True) -> None:
+            close_calls.append(wait)
+
+    runtime = _StreamedExpertCacheRuntime.__new__(_StreamedExpertCacheRuntime)
+    runtime._dummy_prefetcher = Prefetcher()
+    runtime._register_dummy_prefetch_finalizer()
+    runtime_ref = weakref.ref(runtime)
+
+    del runtime
+    gc.collect()
+
+    assert runtime_ref() is None
+    assert close_calls == [True]
+
+
 @pytest.mark.parametrize(
     ("layouts", "num_experts", "error"),
     [
@@ -1123,6 +1314,7 @@ def test_native_prefetch_register_rejects_invalid_template_coverage(
 
     class Binding:
         reserved_slot_indices = (2,)
+        prefetch_slot_indices = (2,)
 
         def prefetch_copy_layouts(self):
             return layouts
@@ -4095,8 +4287,10 @@ def test_large_streamed_host_store_disables_pinned_power_of_two_rounding(
     expert_cache._configure_large_pinned_allocation(33 * 1024**2)
 
     assert applied == [
-        "max_split_size_mb:64,pinned_max_round_threshold_mb:32,"
-        "pinned_max_cached_size_mb:32"
+        (
+            "max_split_size_mb:64,pinned_max_round_threshold_mb:32,"
+            "pinned_max_cached_size_mb:32"
+        )
     ]
 
 
@@ -4243,11 +4437,67 @@ def test_device_loading_context_keeps_streamed_experts_on_cpu(
     with device_loading_context(module, torch.device("cuda")):
         assert module.streamed.device.type == "cpu"
 
-    assert moves == [
-        (resident_ptr, torch.device("cuda")),
-        (resident_ptr, torch.device("cpu")),
-    ]
+    assert moves == [(resident_ptr, torch.device("cuda"))]
     assert all(pointer != streamed_ptr for pointer, _ in moves)
+
+
+def test_device_loading_context_reuses_cpu_storage_after_repacking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = torch.nn.Module()
+    original = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    module.register_parameter(
+        "weight", torch.nn.Parameter(original, requires_grad=False)
+    )
+    original_ptr = module.weight.data_ptr()
+    moves: list[torch.device] = []
+
+    def record_to(
+        tensor: torch.Tensor, device: torch.device, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        del args, kwargs
+        moves.append(torch.device(device))
+        return tensor.clone()
+
+    monkeypatch.setattr(torch.Tensor, "to", record_to)
+
+    with device_loading_context(module, torch.device("cuda")):
+        repacked = torch.arange(12, dtype=torch.float32).reshape(4, 3).t()
+        module.weight = torch.nn.Parameter(repacked, requires_grad=False)
+
+    assert moves == [torch.device("cuda")]
+    assert module.weight.data_ptr() == original_ptr
+    assert module.weight.shape == (3, 4)
+    assert module.weight.stride() == (1, 3)
+    assert torch.equal(module.weight, repacked)
+
+
+def test_device_loading_context_does_not_overrun_original_cpu_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = torch.nn.Module()
+    backing = torch.full((8,), -1.0)
+    module.register_parameter(
+        "weight",
+        torch.nn.Parameter(backing[:4], requires_grad=False),
+    )
+    moves: list[torch.device] = []
+
+    def record_to(
+        tensor: torch.Tensor, device: torch.device, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        del args, kwargs
+        moves.append(torch.device(device))
+        return tensor.clone()
+
+    monkeypatch.setattr(torch.Tensor, "to", record_to)
+
+    with device_loading_context(module, torch.device("cuda")):
+        module.weight = torch.nn.Parameter(torch.arange(6.0), requires_grad=False)
+
+    assert moves == [torch.device("cuda"), torch.device("cpu")]
+    assert torch.equal(backing[4:], torch.full((4,), -1.0))
+    assert torch.equal(module.weight, torch.arange(6.0))
 
 
 def test_streamed_method_rejects_post_load_hot_update(

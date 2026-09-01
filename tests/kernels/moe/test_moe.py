@@ -1396,7 +1396,7 @@ def test_streamed_marlin_mxfp4_waves_match_resident_experts(
             apply_router_weight_on_input=False,
         )
 
-    arena_slots = 3
+    arena_slots = 5
     arena_w1 = torch.empty(
         (arena_slots, *w1_data.qweight.shape[1:]),
         device="cuda",
@@ -1474,6 +1474,7 @@ def test_streamed_marlin_mxfp4_waves_match_resident_experts(
                 debug_log_enable=False,
                 gc_disable=True,
                 weak_ref_output=False,
+                capture_stream=torch.cuda.Stream(),
             ),
         )
 
@@ -1500,7 +1501,7 @@ def test_streamed_marlin_mxfp4_waves_match_resident_experts(
         route_output.fill_(torch.nan)
         expected_written = torch.zeros_like(topk_ids, dtype=torch.bool)
         for logical_expert in range(num_experts):
-            slot = logical_expert % arena_slots
+            slot = (logical_expert + 1) % arena_slots
             arena_w1[slot].copy_(w1_data.qweight[logical_expert])
             arena_w2[slot].copy_(w2_data.qweight[logical_expert])
             arena_w1_scale[slot].copy_(w1_data.scales[logical_expert])
@@ -1757,13 +1758,14 @@ def test_cached_marlin_mxfp4_copy_and_piecewise_replay(
     topk_weights = torch.rand((m, topk), device=device, dtype=torch.float32)
     topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
 
-    compute_stream = torch.cuda.Stream(device=device)
+    compute_stream = torch.cuda.default_stream(device=device)
     with set_current_vllm_config(config), torch.cuda.stream(compute_stream):
         run_case(hidden_states, topk_ids, topk_weights)
         graph_ptrs = cached_layer.graph_data_ptrs
         captured_graph = None
         if use_cudagraph:
             assert isinstance(cached_layer._wave_runner, CUDAGraphWrapper)
+            assert cached_layer._wave_runner.graph_pool is runtime._wave_graph_pool
             captured_graph = cached_layer._wave_runner.concrete_cudagraph_entries[
                 descriptor
             ].cudagraph

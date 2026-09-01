@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from tests.utils import create_new_process_for_each_test
-from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.compilation.cuda_graph import CUDAGraphOptions, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
     CompilationConfig,
@@ -328,6 +328,69 @@ class TestCUDAGraphWrapper:
         # Compare with eager output
         eager_output = self.model(self.input_tensor)
         torch.testing.assert_close(eager_output, output2)
+
+    @pytest.mark.parametrize("use_non_default_caller", [False, True])
+    def test_direct_capture_avoids_device_synchronize(
+        self, use_non_default_caller: bool
+    ):
+        output = torch.zeros_like(self.input_tensor)
+        runnable_streams: list[int] = []
+
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            del x
+            runnable_streams.append(torch.cuda.current_stream().cuda_stream)
+            return torch.add(output, 1, out=output)
+
+        capture_stream = torch.cuda.Stream()
+        original_stream = torch.cuda.current_stream()
+        caller_stream = (
+            torch.cuda.Stream() if use_non_default_caller else original_stream
+        )
+        graph_pool = torch.cuda.graph_pool_handle()
+        wrapper = CUDAGraphWrapper(
+            add_one,
+            self.vllm_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+            cudagraph_options=CUDAGraphOptions(
+                debug_log_enable=False,
+                gc_disable=True,
+                weak_ref_output=False,
+                capture_stream=capture_stream,
+                graph_pool=graph_pool,
+                use_global_graph_pool=False,
+                use_direct_capture=True,
+                warmup_before_capture=True,
+                capture_error_mode="thread_local",
+            ),
+        )
+        batch_descriptor = BatchDescriptor(num_tokens=1)
+
+        with (
+            torch.cuda.stream(caller_stream),
+            set_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+                batch_descriptor=batch_descriptor,
+            ),
+            patch("torch.cuda.synchronize", side_effect=AssertionError),
+            patch("torch.cuda.empty_cache", side_effect=AssertionError),
+            patch("torch.cuda.graph", side_effect=AssertionError),
+        ):
+            captured = wrapper(self.input_tensor)
+            caller_stream.synchronize()
+            torch.testing.assert_close(captured, torch.full_like(captured, 2))
+            replayed = wrapper(self.input_tensor)
+            assert torch.cuda.current_stream() == caller_stream
+
+        caller_stream.synchronize()
+        assert torch.cuda.current_stream() == original_stream
+        assert wrapper.graph_pool is graph_pool
+        assert runnable_streams == [
+            caller_stream.cuda_stream,
+            capture_stream.cuda_stream,
+        ]
+        torch.testing.assert_close(replayed, torch.full_like(replayed, 3))
 
     def test_bypass_on_mode_mismatch(self):
         wrapper = CUDAGraphWrapper(

@@ -82,6 +82,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.nvidia.sm89_sparse import (
+    DeepseekV4SM89SparseAttention,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.flashinfer_moe_ep import (
@@ -1038,6 +1041,12 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             "sparse MLA."
         )
     if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4:
+        if device_capability is not None and device_capability.to_int() == 89:
+            raise ValueError(
+                "FLASHINFER_MLA_SPARSE_DSV4 does not support SM89. Omit the "
+                "explicit backend or use FLASHMLA_SPARSE_DSV4 to select the "
+                "SM89 Triton fallback."
+            )
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
@@ -1045,8 +1054,12 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
     ):
+        if device_capability is not None and device_capability.to_int() == 89:
+            return DeepseekV4SM89SparseAttention
         return DeepseekV4FlashMLAAttention
 
+    if device_capability is not None and device_capability.to_int() == 89:
+        return DeepseekV4SM89SparseAttention
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention
     return DeepseekV4FlashMLAAttention
@@ -1107,7 +1120,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
-        self.hc_attn_fn_broadcast: torch.Tensor | None = None
+        self.register_buffer("hc_attn_fn_broadcast", None, persistent=False)
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
@@ -1620,7 +1633,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 .sum(dim=1)
             )
             if layer.hc_attn_fn_broadcast is None:
-                layer.hc_attn_fn_broadcast = broadcast
+                layer.hc_attn_fn_broadcast = broadcast.to(
+                    device=current_platform.device_type
+                )
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
 

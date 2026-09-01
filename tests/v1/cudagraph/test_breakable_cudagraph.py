@@ -333,6 +333,99 @@ def test_decorator_breaks_when_invoked_inside_capture(cuda_capture_stream):
     assert torch.equal(x, torch.full((4,), 15.0, device="cuda"))
 
 
+def test_streamed_expert_cache_breaks_before_routing(cuda_capture_stream):
+    from types import SimpleNamespace
+
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    hidden_states = torch.zeros((1, 4), dtype=torch.float32, device="cuda")
+    topk_weights = torch.zeros((1, 1), dtype=torch.float32, device="cuda")
+    topk_ids = torch.full((1, 1), -2, dtype=torch.int32, device="cuda")
+    expert_output = torch.empty_like(hidden_states)
+    shared_output = torch.empty_like(hidden_states)
+    shared_staging = torch.empty_like(hidden_states)
+    final_output = torch.empty_like(hidden_states)
+    router_logits = torch.empty_like(hidden_states)
+    capture_states: list[tuple[str, bool]] = []
+
+    class Router:
+        def select_experts(self, **kwargs):
+            capture_states.append(("router", torch.cuda.is_current_stream_capturing()))
+            topk_weights.copy_(kwargs["hidden_states"][:, :1])
+            topk_ids.zero_()
+            return topk_weights, topk_ids
+
+    class CachedExpertLayer:
+        def stage_shared_output(self, output):
+            capture_states.append(
+                ("shared_stage", torch.cuda.is_current_stream_capturing())
+            )
+            shared_staging.copy_(output)
+            return shared_staging
+
+    class RoutedExperts:
+        quant_method = SimpleNamespace(
+            is_monolithic=False,
+            topk_indices_dtype=torch.int32,
+        )
+        cached_expert_layer = CachedExpertLayer()
+
+        def forward_modular(self, **kwargs):
+            capture_states.append(("routed", torch.cuda.is_current_stream_capturing()))
+            assert kwargs["topk_ids"].item() == 0
+            torch.add(kwargs["x"], kwargs["topk_weights"], out=expert_output)
+            return expert_output
+
+    class SharedExperts:
+        output = shared_output
+
+        def __call__(self, shared_experts_input, order):
+            capture_states.append(("shared", torch.cuda.is_current_stream_capturing()))
+            torch.add(shared_experts_input, 2.0, out=shared_output)
+
+    runner = MoERunner.__new__(MoERunner)
+    runner.router = Router()
+    runner.routed_experts = RoutedExperts()
+    runner._shared_experts = SharedExperts()
+
+    cap = BreakableCUDAGraphCapture()
+    with cap:
+        torch.add(hidden_states, 1.0, out=router_logits)
+        staged_shared_output, fused_output = runner._apply_quant_method(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            shared_experts_input=hidden_states,
+        )
+        torch.add(fused_output, staged_shared_output, out=final_output)
+
+    assert cap.num_graphs == 2
+    assert cap.num_eager_breaks == 1
+    assert capture_states == [
+        ("shared", False),
+        ("router", False),
+        ("routed", False),
+        ("shared", False),
+        ("shared_stage", False),
+    ]
+
+    hidden_states.fill_(5.0)
+    cap.replay()
+    cuda_capture_stream.synchronize()
+    assert (
+        capture_states
+        == [
+            ("shared", False),
+            ("router", False),
+            ("routed", False),
+            ("shared", False),
+            ("shared_stage", False),
+        ]
+        * 2
+    )
+    assert torch.equal(final_output, torch.full_like(final_output, 17.0))
+
+
 def test_eager_attention_inside_multistream_overlap(cuda_capture_stream):
     """Handle an eager attention break inside a multi-stream overlap region."""
     from vllm.compilation.breakable_cudagraph import (

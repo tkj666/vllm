@@ -19,6 +19,8 @@ Usage:
     pytest tests/kernels/test_fused_inv_rope_fp8_quant.py -v
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -916,3 +918,178 @@ def test_with_real_deepseek_v4_rope(num_tokens, default_vllm_config):
     assert_dequant_close(
         ref_fp8, ref_scale, fused_fp8, fused_scale, msg="Real DeepSeek V4 rope"
     )
+
+
+@torch.inference_mode()
+def test_sm89_wo_a_processing_retains_grouped_bf16_weight():
+    from vllm.models.deepseek_v4.nvidia.ops.o_proj_fallback import (
+        DeepseekV4WoABf16LinearMethod,
+    )
+
+    layer = torch.nn.Module().cuda()
+    weight = torch.linspace(-4, 4, 48, device="cuda").reshape(8, 6)
+    layer.weight = torch.nn.Parameter(
+        weight.to(torch.float8_e4m3fn), requires_grad=False
+    )
+    scale_bits = torch.tensor(
+        [[127, 128], [126, 129], [125, 127], [128, 126]],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    layer.weight_scale_inv = torch.nn.Parameter(
+        scale_bits.view(torch.float8_e8m0fnu), requires_grad=False
+    )
+    layer.bmm_batch_size = 2
+
+    method = DeepseekV4WoABf16LinearMethod.__new__(DeepseekV4WoABf16LinearMethod)
+    method.block_quant = True
+    method.weight_block_size = [2, 3]
+    method.process_weights_after_loading(layer)
+
+    scale = (scale_bits.to(torch.int32) << 23).view(torch.float32)
+    scale = scale.repeat_interleave(2, dim=0).repeat_interleave(3, dim=1)
+    expected = (weight.to(torch.float8_e4m3fn).float() * scale).to(torch.bfloat16)
+    assert layer.weight.shape == (2, 4, 6)
+    assert layer.weight.dtype == torch.bfloat16
+    assert layer.weight_scale_inv is None
+    torch.testing.assert_close(layer.weight.flatten(0, 1), expected, rtol=0, atol=0)
+
+
+def test_sm89_wo_a_quant_method_dispatch_is_architecture_scoped(
+    monkeypatch, default_vllm_config
+):
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.models.deepseek_v4.nvidia.ops.o_proj_fallback import (
+        DeepseekV4WoABf16LinearMethod,
+    )
+    from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+    from vllm.platforms import current_platform
+
+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    config = DeepseekV4FP8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+    )
+    layer = LinearBase.__new__(LinearBase)
+    default_method = object()
+    monkeypatch.setattr(
+        Fp8Config,
+        "get_quant_method",
+        lambda self, layer, prefix: default_method,
+    )
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 89
+    )
+    method = config.get_quant_method(layer, "model.layers.0.self_attn.wo_a")
+    assert isinstance(method, DeepseekV4WoABf16LinearMethod)
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: False
+    )
+    method = config.get_quant_method(layer, "model.layers.0.self_attn.wo_a")
+    assert method is default_method
+
+
+class _Sm89TestWoB(torch.nn.Module):
+    def __init__(self, input_size: int, output_size: int) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.randn(
+                output_size,
+                input_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.weight)
+
+
+@torch.inference_mode()
+def test_sm89_bf16_o_proj_matches_reference_and_captures():
+    from vllm.models.deepseek_v4.nvidia.ops.o_proj_fallback import (
+        sm89_bf16_o_proj,
+    )
+
+    torch.manual_seed(0)
+    num_tokens = 3
+    num_heads = 4
+    n_groups = 2
+    heads_per_group = num_heads // n_groups
+    head_dim = 32
+    rope_dim = 8
+    o_lora_rank = 16
+    output_size = 24
+    max_pos = 64
+
+    o = torch.randn(
+        num_tokens,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    positions = torch.tensor([0, 7, 31], device="cuda", dtype=torch.long)
+    cos_sin_cache = make_cos_sin_cache(max_pos, rope_dim=rope_dim)
+    wo_a = torch.nn.Module().cuda()
+    wo_a.weight = torch.nn.Parameter(
+        torch.randn(
+            n_groups,
+            o_lora_rank,
+            heads_per_group * head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ),
+        requires_grad=False,
+    )
+    wo_b = _Sm89TestWoB(n_groups * o_lora_rank, output_size)
+
+    rotated = reference_inv_rope(
+        o,
+        positions,
+        cos_sin_cache,
+        nope_dim=head_dim - rope_dim,
+        rope_dim=rope_dim,
+    ).view(num_tokens, n_groups, -1)
+    projected = torch.bmm(
+        rotated.transpose(0, 1), wo_a.weight.transpose(1, 2)
+    ).transpose(0, 1)
+    expected = wo_b(projected.flatten(1))
+
+    for _ in range(2):
+        actual = sm89_bf16_o_proj(
+            o,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_b,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            rope_dim=rope_dim,
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = sm89_bf16_o_proj(
+            o,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_b,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            rope_dim=rope_dim,
+        )
+    output_ptr = captured.data_ptr()
+    graph.replay()
+    first = captured.clone()
+    graph.replay()
+    assert captured.data_ptr() == output_ptr
+    torch.testing.assert_close(captured, first, rtol=0, atol=0)
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)

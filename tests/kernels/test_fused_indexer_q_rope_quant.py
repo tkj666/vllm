@@ -148,8 +148,10 @@ def _reference(
 def test_fused_indexer_q_rope_quant_matches_unfused(
     num_tokens, cache_dtype, use_fp4, use_cutedsl
 ):
-    if use_cutedsl and not has_cutedsl():
-        pytest.skip("cutedsl (cutlass) not installed")
+    if use_cutedsl and not (
+        has_cutedsl() and current_platform.has_device_capability(90)
+    ):
+        pytest.skip("cutedsl (cutlass) requires SM90 or newer")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -210,3 +212,56 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
         f"weights mismatch: max abs diff "
         f"{(weights_ref - weights_fused).abs().max().item()}"
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(89),
+    reason="SM89-specific Triton fallback",
+)
+@torch.inference_mode()
+def test_sm89_fused_indexer_q_triton_fallback_cudagraph():
+    from vllm.models.deepseek_v4.common.ops import fused_indexer_q as module
+
+    num_tokens = 3
+    torch.manual_seed(1)
+    q = torch.randn(num_tokens, N_HEAD, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    positions = torch.tensor([0, 7, 31], dtype=torch.int64, device="cuda")
+    cos_sin_cache = torch.randn(MAX_POS, ROPE_DIM, dtype=torch.float32, device="cuda")
+    weights = torch.randn(num_tokens, N_HEAD, dtype=torch.bfloat16, device="cuda")
+    softmax_scale = HEAD_DIM**-0.5
+    head_scale = N_HEAD**-0.5
+    expected = _reference(
+        positions,
+        q,
+        cos_sin_cache,
+        weights,
+        softmax_scale,
+        head_scale,
+    )
+
+    def run():
+        return module.fused_indexer_q_rope_quant(
+            positions,
+            q,
+            cos_sin_cache,
+            weights,
+            softmax_scale,
+            head_scale,
+        )
+
+    with mock.patch.object(module, "has_cutedsl", return_value=True):
+        eager = run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+
+    pointers = tuple(output.data_ptr() for output in captured)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert tuple(output.data_ptr() for output in captured) == pointers
+    q_reference, weights_reference = expected
+    for q_actual, weights_actual in (eager, captured):
+        assert torch.equal(q_actual.view(torch.int8), q_reference.view(torch.int8))
+        assert torch.equal(weights_actual, weights_reference)

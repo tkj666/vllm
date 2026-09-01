@@ -1182,10 +1182,16 @@ class VllmConfig:
             )
         is_deepseek_v4 = model_config.architecture == "DeepseekV4ForCausalLM"
         if is_deepseek_v4:
-            if not current_platform.support_deep_gemm():
+            device_capability = current_platform.get_device_capability()
+            has_sm89_fallback = (
+                current_platform.is_cuda()
+                and device_capability is not None
+                and device_capability.to_int() == 89
+            )
+            if not current_platform.support_deep_gemm() and not has_sm89_fallback:
                 raise ValueError(
-                    "DeepSeek V4 streamed expert caching requires a Hopper or "
-                    "Blackwell GPU because its attention path requires DeepGEMM."
+                    "DeepSeek V4 streamed expert caching requires either the SM89 "
+                    "Triton fallback or DeepGEMM on Hopper or Blackwell."
                 )
             from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
 

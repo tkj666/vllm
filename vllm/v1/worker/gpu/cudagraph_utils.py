@@ -738,6 +738,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     platform_cls = type(current_platform)
     saved_global_pool = platform_cls._global_graph_pool
     throwaway_pool = current_platform.graph_pool_handle()
+    isolated_throwaway_pool = current_platform.graph_pool_handle()
     platform_cls._global_graph_pool = throwaway_pool
 
     try:
@@ -767,7 +768,14 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             )
             for wrapper in all_wrappers:
                 original_pools[id(wrapper)] = wrapper.graph_pool
-                wrapper.graph_pool = throwaway_pool
+                isolate_pool = getattr(
+                    getattr(wrapper, "cudagraph_options", None),
+                    "isolate_graph_pool",
+                    False,
+                )
+                wrapper.graph_pool = (
+                    isolated_throwaway_pool if isolate_pool else throwaway_pool
+                )
             if speculator is not None:
                 spec_managers = [
                     (name, value)

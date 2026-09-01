@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu import model_runner as mrv2
 
 GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
+ISOLATED_THROWAWAY_POOL = "isolated-throwaway-pool"
 
 
 class _FakeCudaGraphManager:
@@ -268,23 +269,30 @@ def test_profile_cudagraph_memory_redirects_wrapper_pools(monkeypatch):
     create_or_incref_pool assert when the real capture reuses that pool.
     """
     _patch_module(monkeypatch)
+    pools = iter((THROWAWAY_POOL, ISOLATED_THROWAWAY_POOL))
+    monkeypatch.setattr(cgu.current_platform, "graph_pool_handle", lambda: next(pools))
     runner = _make_profiling_runner(CUDAGraphMode.FULL_AND_PIECEWISE)
 
     class _FakeWrapper:
-        def __init__(self) -> None:
+        def __init__(self, *, isolate_graph_pool: bool) -> None:
             self.graph_pool: Any = GLOBAL_POOL
             self.pool_during_capture: Any = None
+            self.cudagraph_options = SimpleNamespace(
+                isolate_graph_pool=isolate_graph_pool
+            )
 
         def clear_graphs(self) -> None:
             pass
 
-    wrapper = _FakeWrapper()
-    cgu.CUDAGraphWrapper._all_instances.add(wrapper)
+    wrapper = _FakeWrapper(isolate_graph_pool=False)
+    isolated_wrapper = _FakeWrapper(isolate_graph_pool=True)
+    cgu.CUDAGraphWrapper._all_instances.update((wrapper, isolated_wrapper))
     try:
         capture_model = runner.capture_model
 
         def _capture_model() -> int:
             wrapper.pool_during_capture = wrapper.graph_pool
+            isolated_wrapper.pool_during_capture = isolated_wrapper.graph_pool
             return capture_model()
 
         runner.capture_model = _capture_model
@@ -292,9 +300,12 @@ def test_profile_cudagraph_memory_redirects_wrapper_pools(monkeypatch):
         cgu.profile_cudagraph_memory(runner)
 
         assert wrapper.pool_during_capture == THROWAWAY_POOL
+        assert isolated_wrapper.pool_during_capture == ISOLATED_THROWAWAY_POOL
         assert wrapper.graph_pool == GLOBAL_POOL
+        assert isolated_wrapper.graph_pool == GLOBAL_POOL
     finally:
         cgu.CUDAGraphWrapper._all_instances.discard(wrapper)
+        cgu.CUDAGraphWrapper._all_instances.discard(isolated_wrapper)
 
 
 def test_profile_cudagraph_memory_swaps_and_drops_speculator_managers(monkeypatch):

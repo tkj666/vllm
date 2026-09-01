@@ -10,6 +10,7 @@ import vllm.model_executor.kernels.mhc  # noqa: F401
 from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
+    mhc_pre_broadcast_tilelang,
 )
 from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
 from vllm.models.deepseek_v4.nvidia.model import (
@@ -197,6 +198,90 @@ def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
 
 
 @pytest.mark.skipif(
+    not HAS_TILELANG_MHC or not current_platform.is_cuda(),
+    reason="CUDA TileLang MHC support required",
+)
+def test_mhc_pre_broadcast_fallback_cuda_graph_replay(monkeypatch):
+    from vllm.utils import deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_supported", lambda: False)
+    monkeypatch.setattr(
+        deep_gemm,
+        "tf32_hc_prenorm_gemm",
+        lambda *args: pytest.fail("fallback must not call DeepGEMM"),
+    )
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    num_tokens = 1
+    hidden_size = 4096
+    hc_mult = 4
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    residual = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16)
+    fn = torch.randn(hc_mult3, hc_mult, hidden_size, dtype=torch.float32) * 1e-4
+    fn_flat = fn.flatten(1)
+    fn_broadcast = fn.sum(dim=1)
+    hc_scale = torch.randn(3, dtype=torch.float32) * 0.1
+    hc_base = torch.randn(hc_mult3, dtype=torch.float32) * 0.1
+    norm_weight = torch.ones(hidden_size, dtype=torch.bfloat16)
+    eps = 1e-6
+
+    def run():
+        return mhc_pre_broadcast_tilelang(
+            residual,
+            fn_flat,
+            hc_scale,
+            hc_base,
+            eps,
+            eps,
+            eps,
+            2.0,
+            20,
+            norm_weight=norm_weight,
+            norm_eps=eps,
+            fn_broadcast=fn_broadcast,
+        )
+
+    residual_broadcast = residual[:, None, :].expand(-1, hc_mult, -1)
+    ref_post, ref_comb, ref_input = mhc_pre_ref(
+        residual_broadcast,
+        fn_flat,
+        hc_scale,
+        hc_base,
+        eps,
+        eps,
+        eps,
+        2.0,
+        20,
+    )
+    ref_input_float = ref_input.float()
+    ref_input = (
+        ref_input_float
+        * torch.rsqrt(ref_input_float.square().mean(dim=-1, keepdim=True) + eps)
+        * norm_weight.float()
+    ).bfloat16()
+
+    eager = run()
+    torch.testing.assert_close(eager[0], residual_broadcast)
+    for actual, reference in zip(
+        eager[1:], (ref_post, ref_comb, ref_input), strict=True
+    ):
+        torch.testing.assert_close(actual, reference, atol=5e-2, rtol=1e-2)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    pointers = tuple(output.data_ptr() for output in captured)
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert tuple(output.data_ptr() for output in captured) == pointers
+    for actual, expected in zip(captured, eager, strict=True):
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
     not HAS_TILELANG_MHC,
     reason="TileLang MHC support required",
 )
@@ -374,7 +459,7 @@ def _make_mhc_decoder_layer(hc_mult: int, hidden_size: int) -> DeepseekV4Decoder
         torch.randn(mix_hc, hc_mult * hidden_size, dtype=torch.float32),
         requires_grad=False,
     )
-    layer.hc_attn_fn_broadcast = None
+    layer.register_buffer("hc_attn_fn_broadcast", None, persistent=False)
     return layer
 
 
@@ -395,7 +480,13 @@ def test_deepseek_v4_mhc_broadcast_finalize_sums_hc_streams(monkeypatch):
     DeepseekV4Model.finalize_mhc_broadcast_weights(model)
 
     assert layer.hc_attn_fn_broadcast is not None
-    expected = layer.hc_attn_fn.detach().view(-1, 2, 8).sum(dim=1)
+    assert "hc_attn_fn_broadcast" in layer._buffers
+    expected = (
+        layer.hc_attn_fn.detach()
+        .view(-1, 2, 8)
+        .sum(dim=1)
+        .to(layer.hc_attn_fn_broadcast.device)
+    )
     assert torch.equal(layer.hc_attn_fn_broadcast, expected)
 
 
@@ -414,5 +505,40 @@ def test_deepseek_v4_mhc_broadcast_refit_refreshes_in_place(monkeypatch):
     DeepseekV4Model.finalize_mhc_broadcast_weights(model)
 
     assert layer.hc_attn_fn_broadcast is buffer
-    expected = layer.hc_attn_fn.detach().view(-1, 2, 8).sum(dim=1)
+    expected = (
+        layer.hc_attn_fn.detach()
+        .view(-1, 2, 8)
+        .sum(dim=1)
+        .to(layer.hc_attn_fn_broadcast.device)
+    )
     assert torch.equal(layer.hc_attn_fn_broadcast, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="PrefetchOffloader requires CUDA",
+)
+def test_deepseek_v4_mhc_broadcast_stays_on_cuda_with_prefetch_offload(monkeypatch):
+    from vllm.model_executor.offloader import prefetch
+
+    monkeypatch.setattr(prefetch, "should_pin_memory", lambda: False)
+    _patch_first_rank_pp_group(monkeypatch)
+    layer = _make_mhc_decoder_layer(hc_mult=2, hidden_size=8).cuda()
+    offloader = prefetch.PrefetchOffloader(
+        group_size=1,
+        num_in_group=1,
+        prefetch_step=1,
+    )
+    offloader.wrap_modules(iter((layer,)))
+    assert layer.hc_attn_fn.device.type == "cpu"
+
+    model = SimpleNamespace(start_layer=0, end_layer=1, layers=[layer])
+    DeepseekV4Model.finalize_mhc_broadcast_weights(model)
+
+    assert layer.hc_attn_fn_broadcast is not None
+    assert layer.hc_attn_fn_broadcast.device.type == "cuda"
+
+    offloader.post_init()
+    offloader.sync_prev_onload()
+    assert layer.hc_attn_fn.device.type == "cuda"
+    assert layer.hc_attn_fn_broadcast.device.type == "cuda"

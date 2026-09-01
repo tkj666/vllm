@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -7,6 +8,10 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
+from vllm.compilation.breakable_cudagraph import (
+    eager_break_during_capture,
+    is_breakable_cudagraph_enabled,
+)
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -106,6 +111,77 @@ def _resolve_layer_name(layer_name: str | LayerName) -> str:
     elif isinstance(layer_name, FakeScriptObject):
         return layer_name.real_obj.value
     return layer_name
+
+
+def _route_streamed_experts(
+    router: FusedMoERouter,
+    routed_experts: RoutedExperts,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts: SharedExperts | None,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    topk_indices_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    topk_weights, topk_ids = router.select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk_indices_dtype=topk_indices_dtype,
+        input_ids=input_ids,
+    )
+    return routed_experts.forward_modular(
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=shared_experts,
+        shared_experts_input=shared_experts_input,
+    )
+
+
+def _apply_streamed_expert_cache(
+    runner: "MoERunner",
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    runner._maybe_apply_shared_experts(
+        shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+    )
+    fused_out = _route_streamed_experts(
+        runner.router,
+        runner.routed_experts,
+        hidden_states,
+        router_logits,
+        runner._shared_experts,
+        shared_experts_input,
+        input_ids,
+        runner._quant_method.topk_indices_dtype,
+    )
+    runner._maybe_apply_shared_experts(
+        shared_experts_input,
+        SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+    )
+    shared_output = (
+        runner._shared_experts.output if runner._shared_experts is not None else None
+    )
+    if shared_output is not None:
+        cached_expert_layer = getattr(
+            runner.routed_experts, "cached_expert_layer", None
+        )
+        if cached_expert_layer is None:
+            raise RuntimeError("streamed expert cache was detached during execution")
+        shared_output = cached_expert_layer.stage_shared_output(shared_output)
+    return shared_output, fused_out
+
+
+@functools.lru_cache(maxsize=2)
+def _streamed_expert_cache_entry(
+    breakable_cudagraph_enabled: bool,
+) -> Callable[..., tuple[torch.Tensor | None, torch.Tensor]]:
+    if not breakable_cudagraph_enabled:
+        return _apply_streamed_expert_cache
+    return eager_break_during_capture(_apply_streamed_expert_cache)
 
 
 # Note: _moe_forward and _moe_forward_shared should not contain any
@@ -589,6 +665,16 @@ class MoERunner(MoERunnerInterface):
         via the router, and the actual fused MoE computation. Returns
         (shared_expert_output, fused_expert_output).
         """
+        cached_expert_layer = getattr(self.routed_experts, "cached_expert_layer", None)
+        if cached_expert_layer is not None:
+            return _streamed_expert_cache_entry(is_breakable_cudagraph_enabled())(
+                self,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
@@ -625,10 +711,6 @@ class MoERunner(MoERunnerInterface):
         shared_output = (
             self._shared_experts.output if self._shared_experts is not None else None
         )
-        cached_expert_layer = getattr(self.routed_experts, "cached_expert_layer", None)
-        if shared_output is not None and cached_expert_layer is not None:
-            shared_output = cached_expert_layer.stage_shared_output(shared_output)
-
         return shared_output, fused_out
 
     def _sequence_parallel_context(self):

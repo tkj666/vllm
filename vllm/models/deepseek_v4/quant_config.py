@@ -171,6 +171,19 @@ class DeepseekV4FP8Config(Fp8Config):
         return cast("DeepseekV4FP8Config", super().from_config(config))
 
     def get_quant_method(self, layer, prefix):
+        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.platforms import current_platform
+
+        if (
+            isinstance(layer, LinearBase)
+            and prefix.endswith(".wo_a")
+            and current_platform.is_device_capability(89)
+        ):
+            from vllm.models.deepseek_v4.nvidia.ops.o_proj_fallback import (
+                DeepseekV4WoABf16LinearMethod,
+            )
+
+            return DeepseekV4WoABf16LinearMethod(self)
         if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
                 prefix=prefix,

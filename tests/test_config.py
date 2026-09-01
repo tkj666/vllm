@@ -216,12 +216,30 @@ def test_expert_cache_accepts_deepseek_v4_fp4_marlin(monkeypatch):
     VllmConfig._verify_expert_cache_config(config)
 
 
-def test_deepseek_v4_expert_cache_rejects_pre_hopper_gpu(monkeypatch):
+def test_deepseek_v4_expert_cache_accepts_sm89_fallback(monkeypatch):
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(current_platform, "support_deep_gemm", lambda: False)
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(to_int=lambda: 89),
+    )
     config = _make_deepseek_v4_expert_cache_config()
 
-    with pytest.raises(ValueError, match="Hopper or Blackwell"):
+    VllmConfig._verify_expert_cache_config(config)
+
+
+def test_deepseek_v4_expert_cache_rejects_unsupported_pre_hopper_gpu(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_platform, "support_deep_gemm", lambda: False)
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(to_int=lambda: 86),
+    )
+    config = _make_deepseek_v4_expert_cache_config()
+
+    with pytest.raises(ValueError, match="SM89 Triton fallback"):
         VllmConfig._verify_expert_cache_config(config)
 
 

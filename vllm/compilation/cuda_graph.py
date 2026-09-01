@@ -129,6 +129,7 @@ class CUDAGraphEntry:
     batch_descriptor: BatchDescriptor
     cudagraph: torch.cuda.CUDAGraph | None = None
     output: Any | None = None
+    capture_warmup_finished: bool = False
 
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
@@ -140,6 +141,13 @@ class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+    capture_stream: torch.cuda.Stream | None = None
+    graph_pool: Any | None = None
+    use_global_graph_pool: bool = True
+    isolate_graph_pool: bool = False
+    use_direct_capture: bool = False
+    warmup_before_capture: bool = False
+    capture_error_mode: str = "global"
 
 
 class CUDAGraphWrapper:
@@ -194,14 +202,15 @@ class CUDAGraphWrapper:
         # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
         # need to initialize a CUDAGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
-        # TODO: in the future, if we want to use multiple
-        # streams, it might not be safe to share a global pool.
-        # only investigate this when we use multiple streams
-        self.graph_pool = current_platform.get_global_graph_pool()
-
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
         self.cudagraph_options = cudagraph_options
+        if cudagraph_options.graph_pool is not None:
+            self.graph_pool = cudagraph_options.graph_pool
+        elif cudagraph_options.use_global_graph_pool:
+            self.graph_pool = current_platform.get_global_graph_pool()
+        else:
+            self.graph_pool = None
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
@@ -263,6 +272,12 @@ class CUDAGraphWrapper:
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
+            if (
+                self.cudagraph_options.warmup_before_capture
+                and not entry.capture_warmup_finished
+            ):
+                self.runnable(*args, **kwargs)
+                entry.capture_warmup_finished = True
             if self.cudagraph_options.debug_log_enable:
                 # Since we capture cudagraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -310,13 +325,12 @@ class CUDAGraphWrapper:
                 get_offloader().sync_prev_onload()
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(
-                    cudagraph,
-                    pool=self.graph_pool,
-                    stream=current_stream(),
-                ):
-                    # `output` is managed by pytorch's cudagraph pool
-                    output = self.runnable(*args, **kwargs)
+                capture_stream = self.cudagraph_options.capture_stream
+                if capture_stream is None:
+                    capture_stream = current_stream()
+
+                def capture_body() -> Any:
+                    captured_output = self.runnable(*args, **kwargs)
                     # Join offloader's copy stream after forward to avoid
                     # unjoined stream error. The last layer's start_prefetch
                     # forks copy_stream, but wait_prefetch only happens in
@@ -329,7 +343,47 @@ class CUDAGraphWrapper:
                         # the last graph in piecewise cuadgraph mode, because
                         # the output of the last graph will not be used by
                         # any other cuda graph.
-                        output = weak_ref_tensors(output)
+                        captured_output = weak_ref_tensors(captured_output)
+                    return captured_output
+
+                if self.cudagraph_options.use_direct_capture:
+                    caller_stream = current_stream()
+                    streams_differ = (
+                        caller_stream.cuda_stream != capture_stream.cuda_stream
+                    )
+                    if streams_differ:
+                        capture_stream.wait_stream(caller_stream)
+                    with torch.cuda.stream(capture_stream):
+                        if self.graph_pool is None:
+                            cudagraph.capture_begin(
+                                capture_error_mode=(
+                                    self.cudagraph_options.capture_error_mode
+                                )
+                            )
+                        else:
+                            cudagraph.capture_begin(
+                                pool=self.graph_pool,
+                                capture_error_mode=(
+                                    self.cudagraph_options.capture_error_mode
+                                ),
+                            )
+                        try:
+                            output = capture_body()
+                        finally:
+                            cudagraph.capture_end()
+                    if streams_differ:
+                        caller_stream.wait_stream(capture_stream)
+                    # Stream capture only records work. Launch on the caller so
+                    # its subsequent last-use event covers this initial replay.
+                    cudagraph.replay()
+                else:
+                    with torch.cuda.graph(
+                        cudagraph,
+                        pool=self.graph_pool,
+                        stream=capture_stream,
+                    ):
+                        # `output` is managed by pytorch's cudagraph pool
+                        output = capture_body()
 
             # here we always use weak ref for the output
             # to save memory

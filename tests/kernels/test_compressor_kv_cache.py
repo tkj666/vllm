@@ -28,8 +28,12 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
     _launch_two_stage_sparse_attn_compressor,
     compress_norm_rope_store_triton,
+    compress_norm_rope_store_two_stage_triton,
 )
-from vllm.models.deepseek_v4.compressor import _get_c128_boundary
+from vllm.models.deepseek_v4.compressor import (
+    _get_c128_boundary,
+    _prefer_two_stage_compressor,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -810,6 +814,106 @@ def _reference_kv_compress_norm_rope(
         return torch.stack(quants), torch.cat(scales)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(89),
+    reason="SM89-specific Triton fallback",
+)
+def test_sm89_sparse_compressor_triton_cudagraph():
+    head_dim = 512
+    nope_dim = 448
+    rope_dim = 64
+    compress_ratio = 4
+    overlap = True
+    state_width = 2 * head_dim
+    state_block_size = 4
+    kv_block_size = 16
+
+    torch.manual_seed(7)
+    state_cache = torch.randn(
+        2,
+        state_block_size,
+        2 * state_width,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    positions = torch.tensor([7], dtype=torch.int64, device="cuda")
+    token_to_req = torch.zeros(1, dtype=torch.int32, device="cuda")
+    slot_mapping = torch.zeros(1, dtype=torch.int64, device="cuda")
+    block_table = torch.arange(2, dtype=torch.int32, device="cuda").unsqueeze(0)
+    rms_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+    cos_sin_cache = torch.randn(8, rope_dim, dtype=torch.float32, device="cuda")
+    kv_cache = torch.zeros(1, kv_block_size, 584, dtype=torch.uint8, device="cuda")
+    metadata = SimpleNamespace(slot_mapping=slot_mapping)
+
+    def run() -> None:
+        compress_norm_rope_store_triton(
+            state_cache=state_cache,
+            num_actual=1,
+            token_to_req_indices=token_to_req,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            block_size=state_block_size,
+            state_width=state_width,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache=kv_cache,
+            k_cache_metadata=metadata,
+            pdl_kwargs={"launch_pdl": False},
+            head_dim=head_dim,
+            rope_head_dim=rope_dim,
+            compress_ratio=compress_ratio,
+            overlap=overlap,
+            use_fp4_cache=False,
+            rms_norm_weight=rms_weight,
+            rms_norm_eps=1e-6,
+            quant_block=64,
+            token_stride=576,
+            scale_dim=8,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    cache_ptr = kv_cache.data_ptr()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert kv_cache.data_ptr() == cache_ptr
+
+    recovered = torch.empty(1, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    seq_lens = torch.ones(1, dtype=torch.int32, device="cuda")
+    gather_table = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
+    dequantize_and_gather_k_cache(
+        recovered,
+        kv_cache,
+        seq_lens,
+        None,
+        gather_table,
+        kv_block_size,
+        offset=0,
+    )
+    recovered = recovered[0]
+    reference = _reference_kv_compress_norm_rope(
+        state_cache,
+        block_table,
+        positions,
+        rms_weight,
+        cos_sin_cache,
+        compress_ratio,
+        int(overlap),
+        rms_eps=1e-6,
+        return_full_cache=True,
+    )
+
+    assert torch.isfinite(recovered).all()
+    _, scales = _ue8m0_reference(reference[0, :nope_dim].float(), 64, 448.0)
+    max_nope_error = 16.0 * scales.max().item()
+    nope_error = (recovered[:, :nope_dim] - reference[:, :nope_dim]).abs().max().item()
+    assert nope_error <= max_nope_error
+    torch.testing.assert_close(recovered[:, nope_dim:], reference[:, nope_dim:])
+
+
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])
 @pytest.mark.parametrize("kv_block_size", [16, 32])
 @pytest.mark.parametrize(
@@ -965,6 +1069,10 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
 
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 @pytest.mark.parametrize("store_fp8", [False, True])
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(90),
+    reason="DeepSeek V4 CuTeDSL compressor requires SM90 or newer",
+)
 def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
     """CuTeDSL compressor full-cache (FlashInfer) store parity for head=512.
 
@@ -1113,8 +1221,8 @@ def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
 
 
 @pytest.mark.skipif(
-    not current_platform.is_rocm(),
-    reason="two-stage split compressor is only enabled for ROCm at the moment",
+    not (current_platform.is_rocm() or current_platform.is_device_capability(89)),
+    reason="two-stage split compressor is enabled on ROCm and SM89",
 )
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 17])
 @pytest.mark.parametrize("kv_block_size", [16, 64])
@@ -1168,28 +1276,72 @@ def test_fused_kv_insert_split(num_tokens: int, kv_block_size: int):
         num_tokens, HEAD_DIM, dtype=torch.float32, device=device
     )
 
-    _launch_two_stage_sparse_attn_compressor(
-        state_cache,
-        token_to_req,
-        positions,
-        slot_mapping,
-        block_table,
-        STATE_BLOCK_SIZE,
-        coff * HEAD_DIM,
-        compress_ratio,
-        cos_sin_cache,
-        kv_cache,
-        slot_mapping,
-        rms_weight,
-        RMS_EPS,
-        QUANT_BLOCK,
-        TOKEN_STRIDE,
-        SCALE_DIM,
-        HEAD_DIM,
-        ROPE_DIM,
-        num_tokens,
-        compress_scratch,
-    )
+    def run() -> None:
+        if current_platform.is_device_capability(89):
+            compress_norm_rope_store_two_stage_triton(
+                state_cache=state_cache,
+                num_actual=num_tokens,
+                token_to_req_indices=token_to_req,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                block_size=STATE_BLOCK_SIZE,
+                state_width=coff * HEAD_DIM,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                k_cache_metadata=SimpleNamespace(slot_mapping=slot_mapping),
+                pdl_kwargs={"launch_pdl": False},
+                head_dim=HEAD_DIM,
+                rope_head_dim=ROPE_DIM,
+                compress_ratio=compress_ratio,
+                overlap=bool(overlap),
+                use_fp4_cache=False,
+                rms_norm_weight=rms_weight,
+                rms_norm_eps=RMS_EPS,
+                quant_block=QUANT_BLOCK,
+                token_stride=TOKEN_STRIDE,
+                scale_dim=SCALE_DIM,
+                num_decode_tokens=num_tokens,
+                compress_scratch=compress_scratch,
+            )
+            return
+        _launch_two_stage_sparse_attn_compressor(
+            state_cache,
+            token_to_req,
+            positions,
+            slot_mapping,
+            block_table,
+            STATE_BLOCK_SIZE,
+            coff * HEAD_DIM,
+            compress_ratio,
+            cos_sin_cache,
+            kv_cache,
+            slot_mapping,
+            rms_weight,
+            RMS_EPS,
+            QUANT_BLOCK,
+            TOKEN_STRIDE,
+            SCALE_DIM,
+            HEAD_DIM,
+            ROPE_DIM,
+            num_tokens,
+            compress_scratch,
+        )
+
+    run()
+
+    if current_platform.is_device_capability(89):
+        assert _prefer_two_stage_compressor()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        cache_ptr = kv_cache.data_ptr()
+        scratch_ptr = compress_scratch.data_ptr()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert kv_cache.data_ptr() == cache_ptr
+        assert compress_scratch.data_ptr() == scratch_ptr
 
     # PyTorch reference: compress -> RMSNorm -> GPT-J RoPE (pre-quant bf16 row).
     ref = _reference_kv_compress_norm_rope(

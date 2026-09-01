@@ -21,6 +21,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_cutedsl
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -37,9 +38,10 @@ from vllm.v1.kv_cache_interface import (
 
 
 def _prefer_two_stage_compressor() -> bool:
-    # Platforms that favor the triton variant of two-stage compressor split.
-    # Currently only tested on ROCm
-    return current_platform.is_rocm()
+    # SM89 uses Triton because the CuTeDSL compressor requires SM90 or newer.
+    return current_platform.is_rocm() or (
+        current_platform.is_cuda() and current_platform.is_device_capability(89)
+    )
 
 
 def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
@@ -195,10 +197,8 @@ class DeepseekCompressor(nn.Module):
 
     Owns the linear / norm / state-cache / ape state and the shared forward
     prologue (kv/score split, save_partial_states launch). The
-    compress → norm → RoPE → store step is dispatched to a triton kernel
-    (``compress_norm_rope_store_triton``) by default, except for the NVIDIA
-    head_dim=128 indexer path which uses the cutedsl kernel
-    (``compress_norm_rope_store_cutedsl``) for better performance.
+    compress → norm → RoPE → store step is dispatched to Triton by default.
+    SM90+ head_dim=512 uses the CuTeDSL compressor.
     """
 
     def __init__(
@@ -396,17 +396,22 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
-        # does not, so the two callables have different signatures.
+        # CuTeDSL accepts the full-cache flags; Triton does not, so the two
+        # callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(90)
+            and has_cutedsl()
+            and self.head_dim == 512
+        ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
+            # SM90+ head=512 uses CuTeDSL for both the fp8_ds_mla layout and
+            # the plain full-cache layout. The full-cache flags are consumed
+            # only here.
             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
             extra_kwargs: dict[str, Any] = dict(
                 store_full_kv=store_full_kv,
@@ -423,7 +428,7 @@ class DeepseekCompressor(nn.Module):
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Single-stage Triton path, including head_dim=128 and SM89 C4.
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 

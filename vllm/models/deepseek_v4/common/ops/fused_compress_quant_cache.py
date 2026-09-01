@@ -614,11 +614,12 @@ def compress_norm_rope_store_two_stage_triton(
 ) -> None:
     """Two-stage split compressor dispatch for head=512 cr>=128 (no-overlap)
 
-    Run the occupancy-fanned two-stage split for prefill [num_decodee_tokens:]
-    to fill the CUs, and use the original single-pass launcher
-    for decode [0, num_decode_tokens)
+    SM89 uses the two-stage split for every token. Other platforms use it for
+    the prefill suffix and retain the original single-stage decode launcher.
     """
     num_decodes = min(max(num_decode_tokens, 0), num_actual)
+    if current_platform.is_cuda() and current_platform.is_device_capability(89):
+        num_decodes = 0
     num_prefills = num_actual - num_decodes
     if num_prefills > 0:
         _launch_two_stage_sparse_attn_compressor(

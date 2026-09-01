@@ -353,10 +353,13 @@ def fused_marlin_moe(
             num_tokens_post_pad_out,
             cumsum_out,
         ) = alignment_outputs
+    num_align_experts = global_num_experts
+    if ignore_invalid_experts:
+        num_align_experts = max(num_align_experts, E)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,
         block_size_m,
-        global_num_experts,
+        num_align_experts,
         expert_map,
         ignore_invalid_experts=ignore_invalid_experts,
         sorted_ids_out=sorted_ids_out,

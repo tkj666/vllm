@@ -355,7 +355,7 @@ class _NativeDummyExpertPrefetcher:
     ) -> None:
         if num_experts <= 0:
             raise ValueError("dummy expert prefetch requires at least one expert")
-        slot_indices = binding.reserved_slot_indices or binding.prefetch_slot_indices
+        slot_indices = binding.prefetch_slot_indices
         ready_events = {slot_index: torch.cuda.Event() for slot_index in slot_indices}
         for event in ready_events.values():
             event.record(self._copy_stream)
@@ -1007,6 +1007,8 @@ class _StreamedExpertCacheRuntime:
         self._last_compute_stream_id: tuple[torch.device, int] | None = None
         self._last_compute_done: torch.cuda.Event | None = None
         self._stream_guard_failed = False
+        self._wave_capture_stream: torch.cuda.Stream | None = None
+        self._wave_graph_pool: Any | None = None
         self._shared_staging: (
             tuple[
                 torch.Tensor,
@@ -1096,9 +1098,13 @@ class _StreamedExpertCacheRuntime:
             if native_copy_scheduler is not None
             else None
         )
+        self._register_dummy_prefetch_finalizer()
+
+    def _register_dummy_prefetch_finalizer(self) -> None:
+        prefetcher = self._dummy_prefetcher
         self._dummy_prefetch_finalizer = (
-            weakref.finalize(self, self._dummy_prefetcher.close, wait=False)
-            if self._dummy_prefetcher is not None
+            weakref.finalize(self, prefetcher.close, wait=True)
+            if prefetcher is not None
             else None
         )
 
@@ -1314,6 +1320,13 @@ class _StreamedExpertCacheRuntime:
             raise RuntimeError("streamed expert-cache stream guard is unavailable")
         if self._last_compute_done is None:
             return
+        stream_id = _stream_identity(stream)
+        if stream_id == self._last_compute_stream_id:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "streamed expert caching does not support overlapping CUDA streams"
+            )
         try:
             complete = self._last_compute_done.query()
         except Exception as exc:
@@ -1321,8 +1334,7 @@ class _StreamedExpertCacheRuntime:
             raise RuntimeError(
                 "failed to query streamed expert-cache forward completion"
             ) from exc
-        stream_id = _stream_identity(stream)
-        if not complete and stream_id != self._last_compute_stream_id:
+        if not complete:
             raise RuntimeError(
                 "streamed expert caching does not support overlapping CUDA streams"
             )
@@ -1415,6 +1427,10 @@ class CachedExpertLayer:
         cudagraph_mode = runtime.vllm_config.compilation_config.cudagraph_mode
         self._wave_runner: Callable[..., Any]
         if cudagraph_mode.has_piecewise_cudagraphs():
+            if runtime._wave_capture_stream is None:
+                runtime._wave_capture_stream = torch.cuda.Stream(device=runtime.device)
+            if runtime._wave_graph_pool is None:
+                runtime._wave_graph_pool = torch.cuda.graph_pool_handle()
             self._wave_runner = CUDAGraphWrapper(
                 self._run_active_wave,
                 runtime.vllm_config,
@@ -1423,6 +1439,13 @@ class CachedExpertLayer:
                     debug_log_enable=False,
                     gc_disable=True,
                     weak_ref_output=False,
+                    capture_stream=runtime._wave_capture_stream,
+                    graph_pool=runtime._wave_graph_pool,
+                    use_global_graph_pool=False,
+                    isolate_graph_pool=True,
+                    use_direct_capture=True,
+                    warmup_before_capture=True,
+                    capture_error_mode="thread_local",
                 ),
             )
         else:
@@ -1662,14 +1685,17 @@ class CachedExpertLayer:
         with torch.cuda.nvtx.range("expert_cache:hard_prepare:cancel_prefetch"):
             self.runtime.cancel_dummy_prefetch_for(self.binding.layer_id)
         with torch.cuda.nvtx.range("expert_cache:hard_prepare:routing_scan"):
-            expert_ids = _ordered_unique(routing_ids)
+            routed_expert_ids = _ordered_unique(routing_ids)
             if any(
-                expert_id < 0 or expert_id >= self.num_experts
-                for expert_id in expert_ids
+                expert_id < -1 or expert_id >= self.num_experts
+                for expert_id in routed_expert_ids
             ):
                 raise ValueError(
                     "routing IDs must be within the configured physical expert range"
                 )
+            expert_ids = tuple(
+                expert_id for expert_id in routed_expert_ids if expert_id >= 0
+            )
         if not expert_ids:
             return _PreparedExpertDemand((), (), (), ())
 
@@ -2204,7 +2230,10 @@ def _invoke_cudagraph_with_initial_replay(
         entry.cudagraph is not None
         for entry in runner.concrete_cudagraph_entries.values()
     )
-    if captured_after > captured_before:
+    if (
+        captured_after > captured_before
+        and not runner.cudagraph_options.use_direct_capture
+    ):
         output = runner(*args)
     return output
 

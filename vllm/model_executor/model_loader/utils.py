@@ -34,6 +34,52 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 logger = init_logger(__name__)
 
 
+def _tensor_storage_span_bytes(tensor: torch.Tensor) -> int | None:
+    if tensor.layout != torch.strided or any(stride < 0 for stride in tensor.stride()):
+        return None
+    if any(size == 0 for size in tensor.shape):
+        return 0
+    storage_elements = 1 + sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return storage_elements * tensor.element_size()
+
+
+def _restore_to_cpu_storage(parameter: nn.Parameter, original: torch.Tensor) -> bool:
+    original_span = _tensor_storage_span_bytes(original)
+    processed_span = _tensor_storage_span_bytes(parameter.data)
+    if original_span is None or processed_span is None:
+        return False
+    if processed_span > original_span:
+        return False
+
+    byte_offset = original.storage_offset() * original.element_size()
+    if byte_offset % parameter.data.element_size() != 0:
+        return False
+
+    if processed_span == 0:
+        restored = torch.empty_strided(
+            parameter.data.shape,
+            parameter.data.stride(),
+            dtype=parameter.data.dtype,
+            device=original.device,
+        )
+    else:
+        restored = torch.empty(
+            0,
+            dtype=parameter.data.dtype,
+            device=original.device,
+        ).set_(
+            original.untyped_storage(),
+            byte_offset // parameter.data.element_size(),
+            parameter.data.shape,
+            parameter.data.stride(),
+        )
+    restored.copy_(parameter.data)
+    parameter.data = restored
+    return True
+
+
 @instrument(span_name="Initialize model")
 def initialize_model(
     vllm_config: VllmConfig,
@@ -159,6 +205,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     original_device_states: dict[str, torch.device] = {}
+    original_cpu_storage: dict[str, torch.Tensor] = {}
     uva_offloaded_parameters: list[str] = []
 
     # Store original device states and move parameters to GPU if they're on CPU
@@ -167,6 +214,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             continue
         if p.device.type == "cpu":
             original_device_states[name] = p.device
+            original_cpu_storage[name] = p.data
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):
             uva_offloaded_parameters.append(name)
@@ -184,7 +232,8 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         for name, p in module.named_parameters():
             if name in original_device_states:
                 original_device: torch.device = original_device_states[name]
-                p.data = p.data.to(original_device)
+                if not _restore_to_cpu_storage(p, original_cpu_storage[name]):
+                    p.data = p.data.to(original_device)
 
             # parameter is UVA offloaded, but was replaced with a new device tensor
             # re-offload it to CPU using UVA

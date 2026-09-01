@@ -9,7 +9,12 @@ import torch
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.config import CUDAGraphMode
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepSeekV32IndexerDecodeMetadata,
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillChunkMetadata,
+    DeepseekV32IndexerPrefillMetadata,
+)
 
 INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
@@ -222,3 +227,164 @@ def test_skipped_k_cache_insert_accepts_no_k(
 
     assert result is topk_indices
     assert torch.all(topk_indices == -1)
+
+
+def _fp8_k_cache(values: torch.Tensor, scale: float) -> torch.Tensor:
+    values_fp8 = values.to(torch.float8_e4m3fn).view(torch.uint8)
+    scale_bytes = torch.tensor([scale], dtype=torch.float32).view(torch.uint8)
+    return torch.cat((values_fp8, scale_bytes)).reshape(1, 1, -1)
+
+
+def _set_sm89_indexer_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: DeepseekV32IndexerMetadata,
+) -> None:
+    monkeypatch.setattr(
+        sparse_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={INDEXER_LAYER: metadata},
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        ),
+    )
+    monkeypatch.setattr(sparse_indexer.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(sparse_indexer.current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(
+        sparse_indexer.current_platform,
+        "fp8_dtype",
+        lambda: torch.float8_e4m3fn,
+    )
+    monkeypatch.setattr(
+        sparse_indexer, "is_deep_gemm_supported", lambda: False, raising=False
+    )
+
+    def unexpected_deep_gemm(*args, **kwargs):
+        pytest.fail("SM89 indexer must not dispatch to DeepGEMM")
+
+    monkeypatch.setattr(sparse_indexer, "fp8_fp4_mqa_logits", unexpected_deep_gemm)
+    monkeypatch.setattr(
+        sparse_indexer, "fp8_fp4_paged_mqa_logits", unexpected_deep_gemm
+    )
+
+
+def test_sm89_prefill_indexer_uses_fp8_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.tensor([[[1.0, 2.0, 0.0, 0.0]]]).to(torch.float8_e4m3fn)
+    k_quant = torch.tensor([[3.0, 4.0, 0.0, 0.0]]).to(torch.float8_e4m3fn)
+    k_scale = torch.tensor([[0.5]], dtype=torch.float32).view(torch.uint8)
+    chunk = DeepseekV32IndexerPrefillChunkMetadata(
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([1], dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
+        token_to_seq=torch.tensor([0], dtype=torch.int32),
+        total_seq_lens=1,
+        token_start=0,
+        token_end=1,
+        num_reqs=1,
+        skip_kv_gather=True,
+        local_cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
+        local_total_seq_lens=1,
+        max_local_total_seq_lens=1,
+    )
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_seq_len=1,
+        slot_mapping=torch.tensor([0]),
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        num_prefill_tokens=1,
+        prefill=DeepseekV32IndexerPrefillMetadata([chunk]),
+    )
+    _set_sm89_indexer_fallback(monkeypatch, metadata)
+    monkeypatch.setattr(
+        sparse_indexer,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(get_simultaneous=lambda *args: (k_quant, k_scale)),
+    )
+    observed = {}
+
+    def record_logits(logits, *args):
+        observed["logits"] = logits
+
+    monkeypatch.setattr(sparse_indexer.ops, "top_k_per_row_prefill", record_logits)
+
+    topk_indices = torch.full((1, 1), -1, dtype=torch.int32)
+    result = sparse_indexer.sparse_attn_indexer(
+        torch.empty(1, 1),
+        INDEXER_LAYER,
+        torch.empty(1),
+        q,
+        None,
+        None,
+        torch.tensor([[2.0]], dtype=torch.float32),
+        128,
+        "ue8m0",
+        1,
+        4,
+        1,
+        1,
+        topk_indices,
+        True,
+        False,
+        "",
+    )
+
+    assert result is topk_indices
+    torch.testing.assert_close(observed["logits"], torch.tensor([[11.0]]))
+
+
+def test_sm89_decode_indexer_uses_fp8_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.tensor([[[1.0, 2.0, 0.0, 0.0]]]).to(torch.float8_e4m3fn)
+    decode = DeepSeekV32IndexerDecodeMetadata(
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([[1]], dtype=torch.int32),
+        decode_lens=torch.tensor([1], dtype=torch.int32),
+        requires_padding=False,
+        schedule_metadata=torch.empty((0, 2), dtype=torch.int32),
+    )
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_seq_len=1,
+        slot_mapping=torch.tensor([0]),
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=decode,
+    )
+    _set_sm89_indexer_fallback(monkeypatch, metadata)
+    observed = {}
+
+    def record_logits(logits, *args):
+        observed["logits"] = logits
+
+    monkeypatch.setattr(sparse_indexer.ops, "top_k_per_row_decode", record_logits)
+
+    topk_indices = torch.full((1, 1), -1, dtype=torch.int32)
+    result = sparse_indexer.sparse_attn_indexer(
+        torch.empty(1, 1),
+        INDEXER_LAYER,
+        _fp8_k_cache(torch.tensor([3.0, 4.0, 0.0, 0.0]), 0.5),
+        q,
+        None,
+        None,
+        torch.tensor([[2.0]], dtype=torch.float32),
+        128,
+        "ue8m0",
+        1,
+        4,
+        1,
+        1,
+        topk_indices,
+        True,
+        False,
+        "",
+    )
+
+    assert result is topk_indices
+    torch.testing.assert_close(observed["logits"], torch.tensor([[11.0]]))
